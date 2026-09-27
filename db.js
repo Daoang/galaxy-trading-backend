@@ -17,6 +17,8 @@ const pool = mysql.createPool({
   charset: "utf8mb4_general_ci",
   waitForConnections: true,
   connectionLimit: 10,
+  // Managed database hosts usually insist on TLS; XAMPP does not offer it.
+  ...(config.DB_SSL ? { ssl: { rejectUnauthorized: false } } : {}),
 });
 
 async function query(sql, params = [], one = false) {
