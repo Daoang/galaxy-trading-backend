@@ -8,6 +8,7 @@
  *     equivalent) — carries {user_id, username, role} and expires.
  *   * requireRole(...) guards endpoints by role name.
  */
+
 const crypto = require("crypto");
 const config = require("./config");
 
