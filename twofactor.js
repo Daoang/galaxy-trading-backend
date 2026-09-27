@@ -157,11 +157,17 @@ router.post(
     // Stored but NOT enabled - it only counts once a code is confirmed below.
     await db.execute("UPDATE tbl_users SET totp_secret=?, totp_enabled=0 WHERE user_id=?",
                      [secret, u.user_id]);
+    // No `image=` parameter here on purpose. A logo URL pushed the otpauth URI
+    // past what a QR at error-correction level H can hold (1636 bits into a
+    // 1056-bit code) and the QR failed to render at all — and Microsoft and
+    // Google Authenticator ignore that parameter anyway, so it bought nothing.
+    // The shop logo is drawn over the middle of the QR by the page instead.
     res.json({
       secret,
       otpauth_uri: totp.otpauthUri(secret, u.username),
       digits: totp.DIGITS,
       period: totp.STEP_SECONDS,
+      logo_url: "../" + config.brandLogo(),
     });
   })
 );
