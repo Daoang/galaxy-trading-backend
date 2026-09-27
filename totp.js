@@ -106,8 +106,16 @@ function verifyCode(secretB32, code, atMs = Date.now()) {
   return false;
 }
 
-/** The otpauth:// URI an authenticator app scans from a QR code. */
-function otpauthUri(secretB32, account, issuer = "Galaxy Trading") {
+/**
+ * The otpauth:// URI an authenticator app scans from a QR code.
+ *
+ * `image` is a widely-used extension, not part of RFC 6238. Apps that honour it
+ * (2FAS, Raivo, Ente and others) will show the shop logo beside the account;
+ * Microsoft Authenticator and Google Authenticator ignore it and fall back to
+ * the issuer name, which is why "Galaxy Trading" is what most staff will see.
+ * Passing it costs nothing and is skipped entirely when no URL is supplied.
+ */
+function otpauthUri(secretB32, account, issuer = "Galaxy Trading", imageUrl = "") {
   const label = encodeURIComponent(issuer) + ":" + encodeURIComponent(account);
   const params = new URLSearchParams({
     secret: secretB32,
@@ -116,6 +124,7 @@ function otpauthUri(secretB32, account, issuer = "Galaxy Trading") {
     digits: String(DIGITS),
     period: String(STEP_SECONDS),
   });
+  if (imageUrl) params.set("image", imageUrl);
   return "otpauth://totp/" + label + "?" + params.toString();
 }
 
