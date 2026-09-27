@@ -18,6 +18,7 @@
  *     script into its own .js file — a real refactor, not a config change.
  */
 const rateLimit = require("express-rate-limit");
+const config = require("./config");
 
 // Origins the frontend genuinely loads from. Anything else is blocked.
 const CDN = [
@@ -91,34 +92,30 @@ const apiLimiter = rateLimit({
 });
 
 /**
- * Allowlist CORS. The frontend now lives on a different host (Hostinger)
- * than this API (Render), so requests are cross-origin by design. Only
- * origins listed in ALLOWED_ORIGINS (.env, comma-separated) get the CORS
- * headers that let the browser accept the response.
+ * CORS: the site itself, plus any origin listed in ALLOWED_ORIGINS.
  *
- * Falls back to same-origin-only behavior if ALLOWED_ORIGINS is unset, so
- * nothing changes for anyone still running the old single-app setup.
+ * With the pages and the API on one host, "the site itself" is all that is
+ * ever needed. Hosting them apart (pages on Hostinger, API on Render) means
+ * naming the pages' address in ALLOWED_ORIGINS — nothing else may call the
+ * API from a browser.
  */
-const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
 function sameOriginCors(req, res, next) {
   const origin = req.headers.origin;
   if (origin) {
     const host = String(req.headers.host || "");
     let sameHost = false;
     try { sameHost = new URL(origin).host === host; } catch (e) { sameHost = false; }
-    const allowed = sameHost || ALLOWED_ORIGINS.includes(origin);
-    if (allowed) {
+    const listed = config.ALLOWED_ORIGINS.includes(String(origin).replace(/\/+$/, ""));
+    if (sameHost || listed) {
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Vary", "Origin");
       res.setHeader("Access-Control-Allow-Credentials", "true");
       res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
       res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS");
+      // Cache the preflight so every API call is not preceded by a second trip.
+      res.setHeader("Access-Control-Max-Age", "600");
     }
-    // A disallowed cross-origin request simply gets no CORS headers, so the browser blocks it.
+    // A cross-origin request simply gets no CORS headers, so the browser blocks it.
   }
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -163,12 +160,42 @@ function checkPasswordStrength(password, username) {
   return null;
 }
 
+// The customer policy lives in ../password-rules.js so the Sign Up page and
+// this server read the exact same rules.
+const PasswordRules = require("../password-rules.js");
+
+/**
+ * Customer passwords (storefront sign-up and change-password).
+ *
+ * Stricter than checkPasswordStrength above: 12+ characters, at least 3 of
+ * lower / upper / number / special, and no more than 2 identical characters in
+ * a row. Staff accounts keep checkPasswordStrength, because the staff
+ * passwords already in use follow a name.surname.role! pattern that has only
+ * two of those four kinds and would be refused here.
+ *
+ * Returns null when acceptable, otherwise a message.
+ */
+function checkCustomerPassword(password, email) {
+  const pw = String(password || "");
+  const problem = PasswordRules.firstProblem(pw);
+  if (problem) return problem;
+  if (COMMON.has(pw.toLowerCase())) {
+    return "That password is too common. Choose something less predictable.";
+  }
+  const e = String(email || "").toLowerCase();
+  if (e && (pw.toLowerCase() === e || pw.toLowerCase() === e.split("@")[0])) {
+    return "Password must not be your email address.";
+  }
+  return null;
+}
+
 module.exports = {
   securityHeaders,
   forceHttps,
   apiLimiter,
   sameOriginCors,
   checkPasswordStrength,
+  checkCustomerPassword,
   isSecure,
   MIN_LENGTH,
 };
