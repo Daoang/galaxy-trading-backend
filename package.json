@@ -4,7 +4,8 @@
   "description": "Galaxy Trading backend (Express) — customer storefront + staff API",
   "main": "app.js",
   "scripts": {
-    "start": "node app.js"
+    "start": "node app.js",
+    "check-email": "node check-email.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -12,6 +13,10 @@
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
     "multer": "^2.0.1",
-    "mysql2": "^3.11.0"
+    "mysql2": "^3.11.0",
+    "nodemailer": "^10.0.10"
+  },
+  "engines": {
+    "node": ">=18.17"
   }
 }
