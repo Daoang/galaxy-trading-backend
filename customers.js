@@ -10,10 +10,18 @@
  *
  * Mounted by app.js. Run database/migration_customer_accounts.sql first.
  */
+const crypto = require("crypto");
 const express = require("express");
 const auth = require("./auth");
 const db = require("./db");
+const config = require("./config");
 const security = require("./security");
+const payments = require("./payments");
+const mailer = require("./mailer");
+const twofactor = require("./twofactor");
+// The storefront catalog. Read here only to know which products may be
+// customized (CUSTOMIZABLE_NAMES), so page and server share one list.
+const catalog = require("../products.js");
 
 const CUSTOMER_ROLE_ID = 6; // tbl_roles: 6 = 'Customer'
 
@@ -21,7 +29,7 @@ const CUSTOMER_ROLE_ID = 6; // tbl_roles: 6 = 'Customer'
 // charged never depends on numbers posted by the browser.
 const CUT_FEE = 20;        // pesos per cut
 const BEND_FEE = 20;       // pesos per bend
-const DELIVERY_FEE = 150;  // flat door-to-door fee; pick-up is free
+const DELIVERY_FEE = config.DELIVERY_FEE;  // flat door-to-door fee; pick-up is free
 const SPLIT_RATE = 0.5;    // split payment = 50% now
 
 const peso = (n) => Math.round((Number(n) || 0) * 100) / 100;
@@ -123,7 +131,9 @@ function publicProfile(row) {
   return {
     user_id: row.user_id,
     username: row.username,
-    name: row.full_name || row.username,
+    // Sign-up no longer asks for a name, so fall back to the first part of
+    // the email rather than the generated internal username.
+    name: row.full_name || (row.email ? String(row.email).split("@")[0] : row.username),
     full_name: row.full_name || "",
     email: row.email || "",
     phone: row.phone || "",
@@ -147,41 +157,321 @@ async function loadProfile(userId) {
 }
 
 // ===========================================================================
-//  REGISTRATION  (public — this is the storefront sign-up form)
+//  REGISTRATION  (public — the storefront sign-up form)
+//
+//  Email is the only identifier a customer supplies. Sign-up is:
+//    1. POST /api/auth/register/start   { email, password, confirm_password }
+//         -> password rules checked, a 6-digit OTP is emailed, and the
+//            browser gets a signup_token (NOT the OTP) naming this attempt
+//    2. POST /api/auth/register/verify  { email, signup_token, code }
+//         -> the account is created only if the OTP matches
+//       POST /api/auth/register/resend  { email, signup_token }
+//         -> a fresh OTP for the same attempt; the old one stops working
+//  No account exists until the owner of the mailbox has typed the code.
+//
+//  The chosen password waits between steps 1 and 2 as a PBKDF2 hash in
+//  tbl_email_verifications (never plain text) and is wiped once used.
+//
+//  There used to be Google and Facebook buttons. They were not real sign-in:
+//  each logged every visitor into one shared account with a password written
+//  into app.js. They and that route are gone.
 // ===========================================================================
+
+const CODE_TTL_MIN = config.OTP_EXPIRES_MINUTES; // OTP_EXPIRES_MINUTES in .env, default 10
+const CODE_MAX_ATTEMPTS = 5;      // wrong guesses before a code is dead
+const RESEND_GAP_SEC = 60;        // no more than one code a minute per address
+const MAX_CODES_PER_HOUR = 5;     // and a ceiling on how often a mailbox is emailed
+
+const SIGNUP_EXPIRED = "This sign-up has expired. Go back and enter your details again.";
+const ALREADY_REGISTERED = "An account already uses this email. Log in instead.";
+
+/** Lower-case, trimmed, and plausibly an address. Returns null if not. */
+function normaliseEmail(raw) {
+  const email = String(raw || "").trim().toLowerCase();
+  if (!email || email.length > 120) return null;
+  // Deliberately simple: something@something.tld with no spaces. The real
+  // proof that an address works is that the customer receives the code.
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return null;
+  return email;
+}
+
+/** HMAC of the code, bound to the address, so a stored row reveals nothing. */
+function hashCode(email, code) {
+  return crypto.createHmac("sha256", config.SECRET_KEY + ":email-verify")
+    .update(email + ":" + code).digest("hex");
+}
+
+/** Only a hash of the sign-up token is stored, like the code itself. */
+function hashToken(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+/** A well-formed token is 64 hex characters; anything else matches nothing. */
+function cleanToken(raw) {
+  const t = String(raw || "").trim().toLowerCase();
+  return /^[a-f0-9]{64}$/.test(t) ? t : null;
+}
+
+/** An internal username the customer never has to know or type. */
+async function makeUsername(email) {
+  const base = email.split("@")[0].replace(/[^a-z0-9._]/g, "").slice(0, 20) || "customer";
+  for (let i = 0; i < 8; i++) {
+    const candidate = `${base}_${crypto.randomBytes(3).toString("hex")}`;
+    if (!(await db.query("SELECT 1 FROM tbl_users WHERE username=?", [candidate], true))) {
+      return candidate;
+    }
+  }
+  return `customer_${crypto.randomBytes(6).toString("hex")}`;
+}
+
+const emailTaken = (email) => db.query("SELECT 1 FROM tbl_users WHERE email=?", [email], true);
+
+/**
+ * Per-address throttle shared by start and resend. Resolves to null when a
+ * code may be sent, otherwise to { status, body } to reply with.
+ */
+async function codeThrottle(email) {
+  // Keep the table from growing forever: anything a day old is useless.
+  await db.execute(
+    "DELETE FROM tbl_email_verifications WHERE created_at < DATE_SUB(NOW(), INTERVAL 1 DAY)");
+
+  const recent = await db.query(
+    "SELECT COUNT(*) AS hour_count, " +
+      "       COALESCE(TIMESTAMPDIFF(SECOND, MAX(created_at), NOW()), 999999) AS since_last " +
+      "FROM tbl_email_verifications " +
+      "WHERE email=? AND purpose='signup' AND created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)",
+    [email], true);
+  if (recent && recent.since_last < RESEND_GAP_SEC) {
+    const wait = RESEND_GAP_SEC - recent.since_last;
+    return { status: 429, body: { error: `Please wait ${wait} seconds before asking for another code.`,
+                                  retry_after: wait } };
+  }
+  if (recent && recent.hour_count >= MAX_CODES_PER_HOUR) {
+    return { status: 429, body: { error: "Too many codes requested for this email. Try again in an hour." } };
+  }
+  return null;
+}
+
+/**
+ * Email a new OTP for one sign-up attempt and record it. Earlier codes for the
+ * same attempt are retired, so only the newest one works.
+ * Resolves to { ok:true, delivery } or { ok:false, status, error }.
+ */
+async function issueCode(req, email, tokenHash, passwordHash) {
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+  const sent = await mailer.sendVerificationCode(req, email, code, CODE_TTL_MIN);
+  if (!sent.ok) return sent;
+
+  await db.execute(
+    "UPDATE tbl_email_verifications SET consumed_at=NOW(), password_hash=NULL " +
+      "WHERE signup_token=? AND consumed_at IS NULL",
+    [tokenHash]);
+  await db.execute(
+    "INSERT INTO tbl_email_verifications " +
+      "(email, purpose, code_hash, password_hash, signup_token, expires_at, ip_address) " +
+      "VALUES (?, 'signup', ?, ?, ?, DATE_ADD(NOW(), INTERVAL ? MINUTE), ?)",
+    [email, hashCode(email, code), passwordHash, tokenHash, CODE_TTL_MIN,
+     String(clientIp(req) || "").slice(0, 45)]);
+  return { ok: true, delivery: sent.delivery };
+}
+
+/** The live (unused) row for one sign-up attempt, or null. */
+function pendingSignup(email, tokenHash) {
+  return db.query(
+    "SELECT verification_id, code_hash, password_hash, attempts, expires_at < NOW() AS expired " +
+      "FROM tbl_email_verifications " +
+      "WHERE email=? AND signup_token=? AND purpose='signup' AND consumed_at IS NULL " +
+      "ORDER BY verification_id DESC LIMIT 1",
+    [email, tokenHash], true);
+}
+
 router.post(
-  "/api/auth/register",
+  "/api/auth/register/start",
   h(async (req, res) => {
     const b = req.body || {};
-    const username = String(b.username || "").trim();
+    const email = normaliseEmail(b.email);
     const password = String(b.password || "");
-    const fullName = String(b.name || b.full_name || "").trim();
-    const phone = String(b.phone || "").trim();
-    const email = String(b.email || "").trim();
+    const confirm = String(b.confirm_password == null ? "" : b.confirm_password);
 
-    if (!username || !password || !fullName) {
-      return res.status(400).json({ error: "Username, full name and password are required." });
+    // The same rules the Sign Up checklist shows (password-rules.js), enforced
+    // here because the page can be bypassed.
+    if (!email) return res.status(400).json({ error: "Enter a valid email address.", field: "email" });
+    const pwErr = security.checkCustomerPassword(password, email);
+    if (pwErr) return res.status(400).json({ error: pwErr, field: "password" });
+    if (password !== confirm) {
+      return res.status(400).json({ error: "Passwords do not match.", field: "confirm" });
     }
-    const pwErr = security.checkPasswordStrength(password, username);
-    if (pwErr) return res.status(400).json({ error: pwErr });
-    if (await db.query("SELECT 1 FROM tbl_users WHERE username=?", [username], true)) {
-      return res.status(409).json({ error: "Username already taken. Choose another." });
+    if (await emailTaken(email)) {
+      return res.status(409).json({ error: ALREADY_REGISTERED, field: "email" });
     }
 
-    const uid = await db.execute(
-      "INSERT INTO tbl_users (username, password_hash, full_name, email, phone, role_id) " +
-        "VALUES (?,?,?,?,?,?)",
-      [username, auth.hashPassword(password), fullName, email || null, phone || null, CUSTOMER_ROLE_ID]
-    );
-    await db.audit(uid, "Customer account created", "tbl_users", clientIp(req));
+    const limited = await codeThrottle(email);
+    if (limited) return res.status(limited.status).json(limited.body);
+
+    // Names this attempt. Only the browser holding it can resend or verify, so
+    // a stranger who starts a sign-up for the same address (with a password of
+    // their own) can never get it activated by the real owner's code.
+    const token = crypto.randomBytes(32).toString("hex");
+    const sent = await issueCode(req, email, hashToken(token), auth.hashPassword(password));
+    if (!sent.ok) return res.status(sent.status || 502).json({ error: sent.error });
+
+    // Deliberately no code in this response — see mailer.js.
+    res.json({ ok: true, email, signup_token: token, expires_in: CODE_TTL_MIN * 60,
+               resend_after: RESEND_GAP_SEC, delivery: sent.delivery });
+  })
+);
+
+router.post(
+  "/api/auth/register/resend",
+  h(async (req, res) => {
+    const b = req.body || {};
+    const email = normaliseEmail(b.email);
+    const token = cleanToken(b.signup_token);
+    if (!email || !token) return res.status(400).json({ error: SIGNUP_EXPIRED, restart: true });
+
+    const tokenHash = hashToken(token);
+    const pending = await pendingSignup(email, tokenHash);
+    if (!pending || !pending.password_hash) {
+      return res.status(400).json({ error: SIGNUP_EXPIRED, restart: true });
+    }
+    if (await emailTaken(email)) return res.status(409).json({ error: ALREADY_REGISTERED });
+
+    const limited = await codeThrottle(email);
+    if (limited) return res.status(limited.status).json(limited.body);
+
+    const sent = await issueCode(req, email, tokenHash, pending.password_hash);
+    if (!sent.ok) return res.status(sent.status || 502).json({ error: sent.error });
+    res.json({ ok: true, email, expires_in: CODE_TTL_MIN * 60,
+               resend_after: RESEND_GAP_SEC, delivery: sent.delivery });
+  })
+);
+
+router.post(
+  "/api/auth/register/verify",
+  h(async (req, res) => {
+    const b = req.body || {};
+    const email = normaliseEmail(b.email);
+    const token = cleanToken(b.signup_token);
+    const code = String(b.code || "").replace(/\D/g, "");
+
+    if (!email || !token) return res.status(400).json({ error: SIGNUP_EXPIRED, restart: true });
+    if (code.length !== 6) return res.status(400).json({ error: "Enter the 6-digit code we emailed you." });
+
+    const pending = await pendingSignup(email, hashToken(token));
+    if (!pending || !pending.password_hash) {
+      return res.status(400).json({ error: SIGNUP_EXPIRED, restart: true });
+    }
+    if (pending.expired) {
+      return res.status(400).json({ error: "That code has expired. Tap Resend OTP for a new one." });
+    }
+    if (pending.attempts >= CODE_MAX_ATTEMPTS) {
+      return res.status(400).json({ error: "Too many wrong codes. Tap Resend OTP for a new one.",
+                                    attempts_left: 0 });
+    }
+
+    const a = Buffer.from(hashCode(email, code));
+    const e = Buffer.from(pending.code_hash);
+    if (a.length !== e.length || !crypto.timingSafeEqual(a, e)) {
+      await db.execute(
+        "UPDATE tbl_email_verifications SET attempts = attempts + 1 WHERE verification_id=?",
+        [pending.verification_id]);
+      const left = Math.max(0, CODE_MAX_ATTEMPTS - (pending.attempts + 1));
+      return res.status(400).json({
+        error: left > 0
+          ? `That code is not right. ${left} attempt${left === 1 ? "" : "s"} left.`
+          : "Too many wrong codes. Tap Resend OTP for a new one.",
+        attempts_left: left,
+      });
+    }
+
+    // Spend the code before creating anything, so a replayed request cannot
+    // create a second account from one email.
+    const spent = await db.pool.query(
+      "UPDATE tbl_email_verifications SET consumed_at=NOW() " +
+        "WHERE verification_id=? AND consumed_at IS NULL",
+      [pending.verification_id]);
+    if (!spent[0].affectedRows) {
+      return res.status(409).json({ error: "That code has already been used." });
+    }
+
+    const username = await makeUsername(email);
+    let uid;
+    try {
+      uid = await db.execute(
+        "INSERT INTO tbl_users (username, password_hash, email, email_verified_at, role_id) " +
+          "VALUES (?,?,?,NOW(),?)",
+        [username, pending.password_hash, email, CUSTOMER_ROLE_ID]);
+    } catch (err) {
+      // Someone finished signing up with this address a moment earlier.
+      if (err && err.code === "ER_DUP_ENTRY") {
+        return res.status(409).json({ error: ALREADY_REGISTERED });
+      }
+      throw err;
+    } finally {
+      // The hash now lives in tbl_users, or is no longer wanted: either way no
+      // pending copy for this address should stay behind.
+      await db.execute(
+        "UPDATE tbl_email_verifications SET password_hash=NULL " +
+          "WHERE email=? AND password_hash IS NOT NULL",
+        [email]);
+    }
+    await db.audit(uid, "Customer account created (email verified by OTP)", "tbl_users", clientIp(req));
 
     const profile = await loadProfile(uid);
-    // Sign the customer straight in, matching the old client-side behaviour.
     res.json({
       ok: true,
       token: auth.issueToken({ user_id: uid, username, role_name: "Customer" },
                              { remember: !!b.remember }),
       user: profile,
+    });
+  })
+);
+
+// ===========================================================================
+//  LOG IN  (storefront — email + password, customers only)
+//
+//  The staff portal keeps its own username login at /api/auth/login. This one
+//  accepts only customer accounts, and that one no longer accepts customers,
+//  so neither door lets the other kind of account through.
+// ===========================================================================
+
+// Verified against when no account matches, so "no such email" and "wrong
+// password" take the same time and cannot be told apart by timing.
+const DUMMY_HASH = auth.hashPassword(crypto.randomBytes(24).toString("hex"));
+
+router.post(
+  "/api/auth/customer/login",
+  h(async (req, res) => {
+    const b = req.body || {};
+    const email = normaliseEmail(b.email);
+    const password = String(b.password || "");
+    const fail = () => res.status(401).json({ error: "Incorrect email or password." });
+    if (!email || !password) return fail();
+
+    const user = await db.query(
+      "SELECT u.user_id, u.username, u.password_hash, u.full_name, u.is_active, " +
+        "       u.totp_enabled, u.totp_secret, r.role_name " +
+        "FROM tbl_users u JOIN tbl_roles r ON r.role_id = u.role_id " +
+        "WHERE u.email = ? AND r.role_name = 'Customer'",
+      [email], true);
+
+    const ok = auth.verifyPassword(password, user ? user.password_hash : DUMMY_HASH);
+    if (!user || !ok || !user.is_active) {
+      if (user) await db.audit(user.user_id, "Failed storefront login", "tbl_users", clientIp(req));
+      return fail();
+    }
+
+    // Same second-factor gate the staff login uses, so the storefront door is
+    // never the weaker one.
+    if (twofactor.requiresTwoFactor(user)) {
+      return res.json(twofactor.challengeResponse(user));
+    }
+
+    await db.audit(user.user_id, "Logged in (storefront)", "tbl_users", clientIp(req));
+    res.json({
+      ok: true,
+      token: auth.issueToken(user, { remember: !!b.remember }),
+      user: { user_id: user.user_id, username: user.username, full_name: user.full_name, role: user.role_name },
     });
   })
 );
@@ -204,12 +494,29 @@ router.patch(
   auth.loginRequired,
   h(async (req, res) => {
     const b = req.body || {};
+
+    // Email is the login, and it was proven by a code at sign-up. Letting it be
+    // edited here would swap the login to an address nobody has verified — or
+    // to someone else's. The account page always sends the current value back,
+    // so an unchanged email is accepted and only a real change is refused.
+    if ("email" in b) {
+      const current = await db.query("SELECT email FROM tbl_users WHERE user_id=?",
+                                     [req.user.user_id], true);
+      const sent = String(b.email || "").trim().toLowerCase();
+      const had = String((current && current.email) || "").toLowerCase();
+      if (sent !== had) {
+        return res.status(400).json({
+          error: "Your email is your login and can't be changed here.",
+        });
+      }
+      delete b.email;
+    }
+
     // Only these columns are editable from the account page; anything else in
     // the body is ignored so a crafted request cannot change a role.
     const map = {
       name: "full_name",
       full_name: "full_name",
-      email: "email",
       phone: "phone",
       dob: "date_of_birth",
       gender: "gender",
@@ -241,9 +548,13 @@ router.post(
     const b = req.body || {};
     const current = String(b.current_password || b.old || "");
     const next = String(b.new_password || b.new || "");
-    const pwErr = security.checkPasswordStrength(next, req.user.username);
+    const row = await db.query("SELECT password_hash, email FROM tbl_users WHERE user_id=?",
+                               [req.user.user_id], true);
+    // Customers follow the same rules as the Sign Up page; staff keep theirs.
+    const pwErr = req.user.role === "Customer"
+      ? security.checkCustomerPassword(next, row && row.email)
+      : security.checkPasswordStrength(next, req.user.username);
     if (pwErr) return res.status(400).json({ error: pwErr });
-    const row = await db.query("SELECT password_hash FROM tbl_users WHERE user_id=?", [req.user.user_id], true);
     if (!row || !auth.verifyPassword(current, row.password_hash)) {
       return res.status(400).json({ error: "Current password is incorrect" });
     }
@@ -346,13 +657,27 @@ router.put(
 // ===========================================================================
 //  ONLINE ORDERS
 // ===========================================================================
-function orderOut(row, items) {
+function orderOut(row, items, fab) {
   const iso = new Date(row.ordered_at).toISOString();
   return {
+    assignedTo: fab && fab.assigned_to !== null ? fab.assigned_to : null,
+    assignedName: (fab && fab.assigned_name) || null,
+    helper1: fab && fab.helper_1 !== null ? fab.helper_1 : null,
+    helper1Name: (fab && fab.helper_1_name) || null,
+    helper2: fab && fab.helper_2 !== null ? fab.helper_2 : null,
+    helper2Name: (fab && fab.helper_2_name) || null,
+    fabJobs: fab ? Number(fab.jobs) : 0,
+    fabJobsDone: fab ? Number(fab.jobs_done) : 0,
     // Both names are emitted because the account page reads `ref` while the
     // staff sales page reads `id` — same order, same reference string.
     id: row.order_ref,
     ref: row.order_ref,
+    // The numeric key, which the fabrication release/assign endpoints address.
+    orderId: row.online_order_id,
+    fabricationDoneAt: row.fabrication_done_at
+      ? new Date(row.fabrication_done_at).toISOString() : null,
+    releasedToDeliveryAt: row.released_to_delivery_at
+      ? new Date(row.released_to_delivery_at).toISOString() : null,
     username: row.username,
     customerName: row.customer_name || row.username,
     address: row.address || "",
@@ -411,7 +736,29 @@ async function loadOrders(where, params) {
   );
   const byOrder = new Map(ids.map((id) => [id, []]));
   for (const it of items) byOrder.get(it.online_order_id).push(it);
-  return orders.map((o) => orderOut(o, byOrder.get(o.online_order_id)));
+
+  // Who on the shop floor is holding this order, and how far along it is. The
+  // sales page needs it to pre-select the right name and to know when the
+  // order is finished enough to release to delivery.
+  const fab = await db.query(
+    "SELECT f.online_order_id, MAX(f.assigned_to) AS assigned_to, " +
+      "       MAX(u.full_name) AS assigned_name, COUNT(*) AS jobs, " +
+      // The helpers the Sales Manager named alongside the main fabricator.
+      "       MAX(f.helper_1) AS helper_1, MAX(h1.full_name) AS helper_1_name, " +
+      "       MAX(f.helper_2) AS helper_2, MAX(h2.full_name) AS helper_2_name, " +
+      "       SUM(f.production_status = 'completed') AS jobs_done " +
+      "FROM tbl_fabrication_logs f LEFT JOIN tbl_users u ON u.user_id = f.assigned_to " +
+      "LEFT JOIN tbl_users h1 ON h1.user_id = f.helper_1 " +
+      "LEFT JOIN tbl_users h2 ON h2.user_id = f.helper_2 " +
+      "WHERE f.online_order_id IN (" + ids.map(() => "?").join(",") + ") " +
+      "GROUP BY f.online_order_id",
+    ids
+  );
+  const fabBy = new Map(fab.map((f) => [f.online_order_id, f]));
+
+  return orders.map((o) =>
+    orderOut(o, byOrder.get(o.online_order_id), fabBy.get(o.online_order_id))
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +844,15 @@ router.post(
       const cuts = isCustom ? Math.max(0, parseInt(it.cuts, 10) || 0) : 0;
       const bends = isCustom ? Math.max(0, parseInt(it.bends, 10) || 0) : 0;
 
+      // Only the products in CUSTOMIZABLE_NAMES can be cut or bent. The page
+      // hides the option for the rest; this stops a crafted request too.
+      if (isCustom && !catalog.isCustomizable(String(it.id || ""))) {
+        return res.status(400).json({
+          error: `"${it.name || "This item"}" can't be customized. Only these products can be ` +
+                 "cut or bent to order: " + catalog.CUSTOMIZABLE_NAMES.join(", ") + ".",
+        });
+      }
+
       if (isCustom && !it.custom_photo) {
         return res.status(400).json({
           error: `"${it.name || "An item"}" is marked for customization, so a reference photo is required.`,
@@ -549,11 +905,16 @@ router.post(
     const channel = b.payment_channel === "gcash" ? "gcash" : "cash";
     let gcashRef = null, gcashReceipt = null, paymentStatus = "unpaid";
     if (channel === "gcash") {
-      gcashRef = String(b.gcash_reference || "").trim();
+      // Same rule the counter uses, so one reference cannot pass one route and
+      // fail the other.
+      const v = payments.normaliseReference(b.gcash_reference);
+      if (!v.ok) return res.status(400).json({ error: v.error });
+      gcashRef = v.ref;
       gcashReceipt = String(b.gcash_receipt || "").trim();
-      if (!gcashRef) return res.status(400).json({ error: "Enter the GCash reference number." });
       if (!gcashReceipt) return res.status(400).json({ error: "Upload a photo of your GCash receipt." });
       // Never auto-mark as paid: a human confirms the transfer arrived.
+      // A reference already used elsewhere does not block the order — it is
+      // saved and shown to the Sales Manager in red.
       paymentStatus = "pending_verification";
     }
 
@@ -633,8 +994,8 @@ router.post(
     const kind = String((req.body || {}).kind || "custom").replace(/[^a-z]/g, "") || "custom";
     const ext = (req.file.mimetype === "image/png") ? "png" : "jpg";
     const name = `${kind}_${req.user.user_id}_${Date.now()}_${Math.floor(Math.random() * 1e4)}.${ext}`;
-    req.app.locals.saveUpload(req.file, name);
-    res.json({ ok: true, path: "uploads/" + name });
+    const stored = await req.app.locals.saveUpload(req.file, name, req.user.user_id);
+    res.json({ ok: true, path: stored });
   })
 );
 
