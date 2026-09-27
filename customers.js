@@ -21,7 +21,7 @@ const mailer = require("./mailer");
 const twofactor = require("./twofactor");
 // The storefront catalog. Read here only to know which products may be
 // customized (CUSTOMIZABLE_NAMES), so page and server share one list.
-const catalog = require("../products.js");
+const catalog = require("./products.js");
 
 const CUSTOMER_ROLE_ID = 6; // tbl_roles: 6 = 'Customer'
 
