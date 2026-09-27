@@ -162,7 +162,7 @@ function checkPasswordStrength(password, username) {
 
 // The customer policy lives in ../password-rules.js so the Sign Up page and
 // this server read the exact same rules.
-const PasswordRules = require("../password-rules.js");
+const PasswordRules = require("./password-rules.js");
 
 /**
  * Customer passwords (storefront sign-up and change-password).
