@@ -27,9 +27,19 @@ const db = require("./db");
 const integrations = require("./integrations");
 const customers = require("./customers");
 const twofactor = require("./twofactor");
+const fabrication = require("./fabrication");
+const suppliers = require("./suppliers");
+const payments = require("./payments");
+const mailer = require("./mailer");
+// Storefront catalog, read for its list of customizable products.
+const catalog = require("../products.js");
 
 const FRONTEND_DIR = path.resolve(__dirname, "..");
-const UPLOAD_DIR = path.join(FRONTEND_DIR, "uploads");
+// UPLOAD_DIR in .env moves this onto a mounted disk for hosts with an
+// ephemeral filesystem; left unset it stays inside the site folder.
+const UPLOAD_DIR = config.UPLOAD_DIR
+  ? path.resolve(config.UPLOAD_DIR)
+  : path.join(FRONTEND_DIR, "uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const app = express();
@@ -66,8 +76,29 @@ const checkoutUpload = multer({
 app.locals.checkoutUpload = (req, res, next) =>
   checkoutUpload(req, res, (err) =>
     err ? res.status(400).json({ error: err.message }) : next());
-app.locals.saveUpload = (file, name) =>
-  fs.renameSync(file.path, path.join(UPLOAD_DIR, name));
+/**
+ * Keep an uploaded picture.
+ *
+ * It goes into MySQL, because a hosting container's filesystem is thrown away
+ * on every restart and a customer's design must not be. A copy is also written
+ * next to the site when that folder is writable, which keeps serving cheap.
+ */
+app.locals.saveUpload = async (file, name, userId) => {
+  const bytes = fs.readFileSync(file.path);
+  await db.execute(
+    "INSERT INTO tbl_uploads (filename, mime_type, size_bytes, content, uploaded_by) " +
+      "VALUES (?,?,?,?,?) ON DUPLICATE KEY UPDATE content=VALUES(content), " +
+      "  mime_type=VALUES(mime_type), size_bytes=VALUES(size_bytes)",
+    [name, file.mimetype || "application/octet-stream", bytes.length, bytes, userId || null]
+  );
+  try {
+    fs.renameSync(file.path, path.join(UPLOAD_DIR, name));
+  } catch (e) {
+    // Read-only or ephemeral disk: the database copy is the one that matters.
+    try { fs.unlinkSync(file.path); } catch (e2) { /* nothing left to clean up */ }
+  }
+  return "uploads/" + name;
+};
 
 function clientIp(req) {
   return req.headers["x-forwarded-for"] || req.socket.remoteAddress;
@@ -110,9 +141,13 @@ const loginLimiterHour = rateLimit({
 //  Sign-up shares the login rate limiters: it is the other way an attacker can
 //  hammer tbl_users.
 // ===========================================================================
-app.use("/api/auth/register", loginLimiterMinute, loginLimiterHour);
+app.use("/api/auth/register", loginLimiterMinute, loginLimiterHour);   // covers /register/start, /resend, /verify
+app.use("/api/auth/customer/login", loginLimiterMinute, loginLimiterHour);
 app.use(customers);
 app.use(twofactor.router);   // 2FA enrolment + the second login step
+app.use(fabrication);        // shop-floor queue, assignment, damage reports
+app.use(suppliers);          // supplier directory (Administrator writes, others read)
+app.use(payments);           // GCash references + the live transaction history
 
 // ===========================================================================
 //  AUTH  (staff portal authenticates here against MySQL tbl_users)
@@ -140,6 +175,13 @@ app.post(
     if (!user || !user.is_active || !auth.verifyPassword(password, user.password_hash)) {
       return res.status(401).json({ error: "Incorrect username or password" });
     }
+    // Staff sign in here by username. Customers sign in on the storefront by
+    // email (POST /api/auth/customer/login). Refusing them here keeps "email
+    // only" true for customers — otherwise this route would be a way round it.
+    // Same message as a wrong password, so it reveals nothing about the account.
+    if (user.role_name === "Customer") {
+      return res.status(401).json({ error: "Incorrect username or password" });
+    }
 
     // Password was right. If this account has a second factor, stop here and
     // return a short-lived challenge - no session token is issued yet.
@@ -156,31 +198,26 @@ app.post(
   })
 );
 
+/**
+ * Health check for the hosting platform (Render pings this). Deliberately
+ * says nothing about the system beyond "the process is up and MySQL answers".
+ */
+app.get("/healthz", async (req, res) => {
+  try {
+    await db.query("SELECT 1");
+    res.json({ ok: true, database: "up" });
+  } catch (e) {
+    res.status(503).json({ ok: false, database: "down" });
+  }
+});
+
 app.get("/api/auth/me", auth.loginRequired, (req, res) => {
   res.json({ user: req.user });
 });
 
 // ===========================================================================
-//  SHARED SERVICES  (geocode / OTP / captcha)
+//  SHARED SERVICES  (captcha)
 // ===========================================================================
-app.post(
-  "/api/otp/send",
-  auth.loginRequired,
-  h(async (req, res) => {
-    const body = req.body || {};
-    res.json(await integrations.sendOtp(body.phone || ""));
-  })
-);
-
-app.post(
-  "/api/otp/verify",
-  auth.loginRequired,
-  h(async (req, res) => {
-    const body = req.body || {};
-    res.json(await integrations.verifyOtp(body.phone || "", body.code || ""));
-  })
-);
-
 app.post(
   "/api/captcha/verify",
   h(async (req, res) => {
@@ -198,7 +235,10 @@ app.get(
   h(async (req, res) => {
     const rows = await db.query(
       "SELECT u.user_id, u.username, u.full_name, u.email, u.phone, " +
-        "       u.is_active, r.role_name, u.created_at " +
+        "       u.is_active, r.role_name, u.created_at, " +
+        // so the admin table can show who has a second factor, and offer to
+        // clear it for anyone whose phone is lost or broken
+        "       u.totp_enabled, u.totp_enrolled_at " +
         "FROM tbl_users u JOIN tbl_roles r ON r.role_id = u.role_id " +
         "ORDER BY u.user_id"
     );
@@ -220,10 +260,31 @@ app.post(
     if (await db.query("SELECT 1 FROM tbl_users WHERE username=?", [b.username], true)) {
       return res.status(409).json({ error: "Username already exists" });
     }
+
+    const role = await db.query("SELECT role_name FROM tbl_roles WHERE role_id=?", [b.role_id], true);
+    if (!role) return res.status(400).json({ error: "Choose a role for this account." });
+    const isCustomer = role.role_name === "Customer";
+
+    // Customers sign in with their email, so an account without one could never
+    // be used. Staff sign in by username, where the email is optional.
+    const email = String(b.email || "").trim().toLowerCase() || null;
+    if (isCustomer && !email) {
+      return res.status(400).json({ error: "A customer account needs an email address: it is their login." });
+    }
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
+      return res.status(400).json({ error: "Enter a valid email address." });
+    }
+    if (email && (await db.query("SELECT 1 FROM tbl_users WHERE email=?", [email], true))) {
+      return res.status(409).json({ error: "Another account already uses this email." });
+    }
+
     const uid = await db.execute(
-      "INSERT INTO tbl_users (username, password_hash, full_name, email, phone, role_id) " +
-        "VALUES (?,?,?,?,?,?)",
-      [b.username, auth.hashPassword(b.password), b.full_name || null, b.email || null, b.phone || null, b.role_id]
+      "INSERT INTO tbl_users (username, password_hash, full_name, email, phone, role_id, email_verified_at) " +
+        "VALUES (?,?,?,?,?,?,?)",
+      [b.username, auth.hashPassword(b.password), b.full_name || null, email, b.phone || null, b.role_id,
+       // The Administrator vouched for this address, so the customer does not
+       // have to go through the sign-up code before they can log in.
+       isCustomer ? new Date() : null]
     );
     await db.audit(req.user.user_id, `Created user '${b.username}'`, "tbl_users", clientIp(req));
     res.json({ ok: true, user_id: uid });
@@ -327,40 +388,68 @@ app.get(
   "/api/admin/reports/feed/:panel",
   auth.requireRole("Administrator"),
   h(async (req, res) => {
-    const limit = Math.min(500, Math.max(1, parseInt(req.query.limit || "200", 10)));
+    // One page at a time: the audit trail alone is hundreds of rows, and the
+    // dashboard's "View all" only ever shows one page of them.
+    const perPage = Math.min(100, Math.max(1, parseInt(req.query.per_page || "20", 10)));
+    const page = Math.max(1, parseInt(req.query.page || "1", 10));
+    const offset = (page - 1) * perPage;
     const panel = String(req.params.panel || "");
 
-    if (panel === "orders") {
-      const rows = await db.query(RECENT_ORDERS_SQL + " LIMIT " + limit);
-      return res.json({ panel, title: "All Orders", rows: rows.map(orderRow) });
-    }
-    if (panel === "audit") {
-      const rows = await db.query(RECENT_AUDIT_SQL + " LIMIT " + limit);
-      return res.json({ panel, title: "All Audit Logs", rows: rows.map(auditRow) });
-    }
-    if (panel === "activity") {
-      const rows = await db.query(STAFF_ACTIVITY_SQL + " LIMIT " + limit);
-      return res.json({ panel, title: "All Employee Activity", rows: rows.map(auditRow) });
-    }
-    if (panel === "alerts") {
-      const rows = await db.query(
-        "SELECT material_id, material_name, stock_quantity, reorder_level, unit_of_measure " +
-          "FROM tbl_raw_materials WHERE stock_quantity < reorder_level " +
-          "ORDER BY (stock_quantity / NULLIF(reorder_level,0)) ASC LIMIT " + limit
-      );
-      return res.json({
-        panel,
+    const ALERTS_SQL =
+      "SELECT material_id, material_name, stock_quantity, reorder_level, unit_of_measure " +
+      "FROM tbl_raw_materials WHERE stock_quantity < reorder_level " +
+      "ORDER BY (stock_quantity / NULLIF(reorder_level,0)) ASC";
+
+    const PANELS = {
+      orders: {
+        title: "All Orders",
+        sql: RECENT_ORDERS_SQL,
+        count: "SELECT COUNT(*) c FROM tbl_orders",
+        shape: orderRow,
+      },
+      audit: {
+        title: "All Audit Logs",
+        sql: RECENT_AUDIT_SQL,
+        count: "SELECT COUNT(*) c FROM tbl_audit_logs",
+        shape: auditRow,
+      },
+      activity: {
+        title: "All Employee Activity",
+        sql: STAFF_ACTIVITY_SQL,
+        count: "SELECT COUNT(*) c FROM tbl_audit_logs a " +
+               "JOIN tbl_users u ON u.user_id = a.user_id " +
+               "JOIN tbl_roles r ON r.role_id = u.role_id WHERE r.role_name <> 'Customer'",
+        shape: auditRow,
+      },
+      alerts: {
         title: "All Inventory Alerts",
-        rows: rows.map((m) => ({
+        sql: ALERTS_SQL,
+        count: "SELECT COUNT(*) c FROM tbl_raw_materials WHERE stock_quantity < reorder_level",
+        shape: (m) => ({
           name: m.material_name,
           unit: m.unit_of_measure,
           stock: parseFloat(m.stock_quantity),
           reorder: parseFloat(m.reorder_level),
           deficit: Math.round((parseFloat(m.reorder_level) - parseFloat(m.stock_quantity)) * 100) / 100,
-        })),
-      });
-    }
-    res.status(404).json({ error: "Unknown panel: " + panel });
+        }),
+      },
+    };
+
+    const view = PANELS[panel];
+    if (!view) return res.status(404).json({ error: "Unknown panel: " + panel });
+
+    const total = ((await db.query(view.count, [], true)) || {}).c || 0;
+    // LIMIT/OFFSET are numbers this function computed, never text from the URL.
+    const rows = await db.query(`${view.sql} LIMIT ${perPage} OFFSET ${offset}`);
+    res.json({
+      panel,
+      title: view.title,
+      rows: rows.map(view.shape),
+      page,
+      per_page: perPage,
+      total,
+      pages: Math.max(1, Math.ceil(total / perPage)),
+    });
   })
 );
 
@@ -545,7 +634,9 @@ app.get(
       services: {
         "MySQL Database": { ok: dbOk, latency_ms: dbMs },
         Captcha: { ok: true, enforced: config.CAPTCHA_REQUIRED },
-        "Firebase Auth": { ok: !!config.FIREBASE_PROJECT_ID, configured: !!config.FIREBASE_PROJECT_ID },
+        // Storefront sign-up cannot finish without it: the OTP is emailed via
+        // Gmail or Resend. Unset means codes only print in the server terminal.
+        ["Email (" + mailer.providerLabel() + ")"]: { ok: mailer.isConfigured(), configured: mailer.isConfigured() },
       },
       counts,
     });
@@ -685,7 +776,7 @@ app.get(
   "/api/sales/config",
   auth.requireRole("Sales Manager", "Administrator"),
   (req, res) => {
-    res.json({ business: config.BUSINESS, vat_rate: config.VAT_RATE, high_value_threshold: config.HIGH_VALUE_THRESHOLD });
+    res.json({ business: config.BUSINESS, vat_rate: config.VAT_RATE, delivery_fee: config.DELIVERY_FEE });
   }
 );
 
@@ -722,10 +813,10 @@ app.post(
   auth.requireRole("Sales Manager", "Administrator"),
   h(async (req, res) => {
     /*
-     * Create a walk-in sale. VAT-inclusive math. Sales >= threshold need an OTP
-     * (otp_code, verified server-side). On success the order is marked
-     * paid and pushed to fabrication (if it has custom jobs) or delivery, exactly
-     * like an approved online order.
+     * Create a walk-in sale. VAT-inclusive math. On success the order is
+     * marked paid and pushed to fabrication (if it has custom jobs) or
+     * delivery, exactly like an approved online order. There is no extra
+     * confirmation step for large sales any more.
      */
     const b = req.body || {};
     const cust = b.customer || {};
@@ -737,56 +828,127 @@ app.post(
 
     // ---- totals (VAT-inclusive) ----
     let gross = 0.0;
+    let deliveryLines = 0;
     for (const it of items) {
+      // The delivery fee is a normal sale line, but its amount is the shop's
+      // fixed fee — whatever the page sent for price or quantity is ignored.
+      if (it.kind === "delivery") {
+        deliveryLines += 1;
+        it.qty = 1;
+        it.unit_price = config.DELIVERY_FEE;
+        it._desc = "Delivery Fee";
+      }
       const qty = parseFloat(it.qty || 0);
       const price = parseFloat(it.unit_price || 0);
       if (qty <= 0 || price < 0) {
         return res.status(400).json({ error: "Each line needs a positive quantity and price" });
+      }
+      // A custom cut/bend job must name the customizable product it is made
+      // from. Anything not in CUSTOMIZABLE_NAMES (products.js) is refused.
+      if ((it.kind || "product") === "custom") {
+        const prod = catalog.PRODUCTS.find((p) => p.id === String(it.catalog_id || ""));
+        if (!prod || !prod.customizable) {
+          return res.status(400).json({
+            error: "Custom cut/bend is only for these products: " +
+                   catalog.CUSTOMIZABLE_NAMES.join(", ") + ". Choose one for each custom job.",
+          });
+        }
+        const variant = [prod.size, prod.color && "(" + prod.color + ")"].filter(Boolean).join(" ");
+        // Written by the server so the receipt and the fabrication queue always
+        // say which item is being cut or bent.
+        it._desc = `${prod.name} ${variant} — custom cut/bend`.slice(0, 255);
+        // The instructions are for the shop floor only: kept on the custom job
+        // and shown in the Fabrication Panel, never printed on the receipt.
+        it._notes = String(it.notes || "").trim().slice(0, 500) || null;
       }
       it._qty = qty;
       it._price = price;
       it._sub = Math.round(qty * price * 100) / 100;
       gross += it._sub;
     }
+    // Custom work can be handed to the floor straight from the counter: one
+    // main fabricator, plus up to two helpers.
+    const assignTo = b.assign_to ? parseInt(b.assign_to, 10) : null;
+    if (assignTo) {
+      const who = await db.query(
+        "SELECT u.user_id FROM tbl_users u JOIN tbl_roles r ON r.role_id=u.role_id " +
+          "WHERE u.user_id=? AND u.is_active=1 AND r.role_name IN ('Fabrication','Employee')",
+        [assignTo], true);
+      if (!who) return res.status(400).json({ error: "That user is not a fabrication employee." });
+    }
+    const helpers = await fabrication.readHelpers(b, assignTo);
+    if (helpers.error) return res.status(400).json({ error: helpers.error });
+
+    if (deliveryLines > 1) {
+      return res.status(400).json({ error: "Add the delivery fee only once per sale." });
+    }
+    if (deliveryLines && !String(cust.address || "").trim()) {
+      return res.status(400).json({ error: "Enter the customer's delivery address for a sale with delivery." });
+    }
     const discount = parseFloat(b.discount_amount || 0);
     const totalDue = Math.round(Math.max(gross - discount, 0) * 100) / 100;
     const vatable = Math.round((totalDue / (1 + config.VAT_RATE)) * 100) / 100;
     const vat = Math.round((totalDue - vatable) * 100) / 100;
 
-    // ---- high-value OTP gate ----
-    if (totalDue >= config.HIGH_VALUE_THRESHOLD) {
-      const code = (b.otp_code || "").trim();
-      if (!code) {
-        return res.status(200).json({
-          requires_otp: true,
-          phone,
-          message: "This sale needs SMS verification. Send and enter the OTP.",
-        });
-      }
-      const chk = await integrations.verifyOtp(phone, code);
-      if (!chk.ok) {
-        return res.status(400).json({ error: chk.error || "OTP verification failed", requires_otp: true });
-      }
+    // ---- money received, and the customer's change ----
+    // Left blank, the customer is taken to have paid the exact amount.
+    const paidRaw = b.amount_paid === undefined || b.amount_paid === null || b.amount_paid === ""
+      ? totalDue : parseFloat(b.amount_paid);
+    if (!Number.isFinite(paidRaw) || paidRaw < 0) {
+      return res.status(400).json({ error: "Enter the amount the customer paid." });
+    }
+    const amountPaid = Math.round(paidRaw * 100) / 100;
+    if (amountPaid < totalDue) {
+      return res.status(400).json({
+        error: `The amount paid is short by ${peso(totalDue - amountPaid)}.`,
+      });
+    }
+    const change = Math.round((amountPaid - totalDue) * 100) / 100;
+
+    // A sale is a delivery only if the Delivery Fee was added; otherwise the
+    // customer takes it from the shop and nothing goes to the Delivery panel.
+    const fulfillment = deliveryLines ? "delivery" : "pickup";
+
+    // ---- payment channel ----
+    // Cash or GCash; there is no card terminal in the shop. A GCash sale needs
+    // a reference number, and a reference already claimed by another order is
+    // recorded rather than refused — see payments.js for why.
+    const channel = String(b.payment_channel || b.payment_method || "cash").toLowerCase() === "gcash"
+      ? "gcash" : "cash";
+    let gcashRef = null;
+    let duplicateOf = [];
+    if (channel === "gcash") {
+      const v = payments.normaliseReference(b.gcash_reference);
+      if (!v.ok) return res.status(400).json({ error: v.error });
+      gcashRef = v.ref;
+      duplicateOf = await payments.findReferenceUses(gcashRef);
     }
 
     // ---- persist ----
     const customerId = await walkinCustomer(name, phone);
     const invoiceNo = await nextInvoiceNo();
     const orderId = await db.execute(
-      "INSERT INTO tbl_orders (customer_id, order_reference, invoice_no, sale_type, " +
+      "INSERT INTO tbl_orders (customer_id, order_reference, invoice_no, sale_type, fulfillment, " +
         " order_date, total_amount, discount_amount, vatable_sales, vat_amount, amount_paid, " +
-        " payment_method, order_status, delivery_address, customer_tin, business_address) " +
-        "VALUES (?,?,?,'walkin',NOW(),?,?,?,?,?,?,'approved',?,?,?)",
+        " payment_method, payment_channel, gcash_reference, payment_status, " +
+        " order_status, delivery_address, customer_tin, business_address) " +
+        "VALUES (?,?,?,'walkin',?,NOW(),?,?,?,?,?,?,?,?,?,'approved',?,?,?)",
       [
         customerId,
         invoiceNo,
         invoiceNo,
+        fulfillment,
         totalDue,
         discount,
         vatable,
         vat,
-        parseFloat(b.amount_paid || totalDue),
-        b.payment_method || "cash",
+        amountPaid,
+        channel,
+        channel,
+        gcashRef,
+        // Cash is handed over at the counter, so it is settled. A GCash
+        // transfer is only a claim until somebody checks it arrived.
+        channel === "gcash" ? "pending_verification" : "paid",
         cust.address || null,
         cust.tin || null,
         cust.address || null,
@@ -796,14 +958,16 @@ app.post(
     let hasCustom = false;
     for (const it of items) {
       const kind = it.kind || "product";
-      const pid = kind === "product" ? it.product_id : null;
-      const desc = it.name || it.description;
+      // A custom job is cut from a real product, so it carries (and draws
+      // stock from) that product too. Manual lines have no product.
+      const pid = kind === "manual" || kind === "delivery" ? null : (parseInt(it.product_id, 10) || null);
+      const desc = it._desc || it.name || it.description;
       const oiid = await db.execute(
         "INSERT INTO tbl_order_items (order_id, product_id, item_description, quantity, " +
           " unit_price, subtotal) VALUES (?,?,?,?,?,?)",
         [orderId, pid || null, desc, it._qty, it._price, it._sub]
       );
-      if (kind === "product" && pid) {
+      if (pid) {
         await db.execute(
           "UPDATE tbl_products SET stock_quantity = GREATEST(stock_quantity-?,0) WHERE product_id=?",
           [Math.trunc(it._qty), pid]
@@ -812,29 +976,38 @@ app.post(
       if (kind === "custom") {
         const cj = await db.execute(
           "INSERT INTO tbl_custom_jobs (order_item_id, cutting_length_meters, number_of_cuts, " +
-            " bending_angle_degrees, number_of_bends, design_file_path) VALUES (?,?,?,?,?,?)",
+            " bending_angle_degrees, number_of_bends, instructions, design_file_path) VALUES (?,?,?,?,?,?,?)",
           [
             oiid,
             it.cutting_length_meters ?? null,
             it.number_of_cuts ?? null,
             it.bending_angle_degrees ?? null,
             it.number_of_bends ?? null,
+            it._notes ?? null,
             it.design_file_path ?? null,
           ]
         );
-        await db.execute("INSERT INTO tbl_fabrication_logs (custom_job_id, production_status) VALUES (?,'queued')", [
-          cj,
-        ]);
+        await db.execute(
+          "INSERT INTO tbl_fabrication_logs (custom_job_id, production_status, " +
+            " assigned_to, helper_1, helper_2, assigned_by, assigned_at) " +
+            "VALUES (?,'queued',?,?,?,?,?)",
+          [cj, assignTo, helpers.h1, helpers.h2,
+           assignTo ? req.user.user_id : null, assignTo ? new Date() : null]);
         hasCustom = true;
       }
     }
 
     // ---- route it like an approved order ----
+    // Custom work goes to Fabrication first (and on to delivery when it is done,
+    // if this is a delivery). Otherwise a delivery is queued for the Delivery
+    // panel now, and a pick-up is simply ready at the counter.
     if (hasCustom) {
       await db.execute("UPDATE tbl_orders SET order_status='in_production' WHERE order_id=?", [orderId]);
     } else {
       await db.execute("UPDATE tbl_orders SET order_status='ready' WHERE order_id=?", [orderId]);
-      await db.execute("INSERT INTO tbl_deliveries (order_id, delivery_status) VALUES (?,'queued')", [orderId]);
+      if (fulfillment === "delivery") {
+        await db.execute("INSERT INTO tbl_deliveries (order_id, delivery_status) VALUES (?,'queued')", [orderId]);
+      }
     }
 
     await db.audit(req.user.user_id, `Walk-in sale ${invoiceNo} (${peso(totalDue)})`, "tbl_orders", clientIp(req));
@@ -846,7 +1019,7 @@ app.post(
       cashier: req.user.username,
       customer: { name, phone, tin: cust.tin, address: cust.address },
       items: items.map((it) => ({
-        description: it.name || it.description,
+        description: it._desc || it.name || it.description,
         qty: it._qty,
         unit_price: it._price,
         amount: it._sub,
@@ -856,11 +1029,27 @@ app.post(
       vatable_sales: vatable,
       vat,
       total_due: totalDue,
-      routed_to: hasCustom ? "fabrication" : "delivery",
+      amount_paid: amountPaid,
+      change,
+      fulfillment,
+      // What the receipt prints on its "Fulfilment" line.
+      assigned_to: assignTo,
+      helper_names: helpers.names,
+      routed_to: (hasCustom ? "Fabrication, then " : "") +
+                 (fulfillment === "delivery" ? "delivery" : "pick-up at the shop"),
       business: config.BUSINESS,
       vat_rate: config.VAT_RATE,
+      payment_channel: channel,
+      gcash_reference: gcashRef,
     };
-    res.json({ ok: true, receipt });
+    // The sale is saved either way; the warning is so the cashier can query it
+    // with the customer while they are still at the counter.
+    res.json({
+      ok: true,
+      receipt,
+      duplicate_reference: duplicateOf.length > 0,
+      duplicate_with: duplicateOf,
+    });
   })
 );
 
@@ -869,7 +1058,9 @@ app.post(
 // ===========================================================================
 app.get(
   "/api/inventory/raw-materials",
-  auth.requireRole("Inventory Manager", "Administrator"),
+  // Read-only. The shop floor needs stock and reorder levels to judge whether a
+  // job can start; changing those figures stays with Inventory (PATCH below).
+  auth.requireRole("Inventory Manager", "Administrator", "Sales Manager", "Employee", "Fabrication"),
   h(async (req, res) => {
     res.json({ materials: await db.query("SELECT * FROM tbl_raw_materials ORDER BY material_name") });
   })
@@ -941,25 +1132,20 @@ app.get(
 // ===========================================================================
 //  EMPLOYEE (FABRICATION)
 // ===========================================================================
-app.get(
-  "/api/fabrication/jobs",
+// The queue, job detail, history, assignment and damage reports now live in
+// fabrication.js, which serves storefront and walk-in orders from one list.
+// What stays here is the status machine and the shop-floor notes.
+
+// Shop-floor notes against a job.
+app.post(
+  "/api/fabrication/jobs/:fid/notes",
   auth.requireRole("Employee", "Fabrication", "Administrator"),
   h(async (req, res) => {
-    const rows = await db.query(
-      "SELECT f.fab_log_id, f.production_status, f.scrap_waste_generated, " +
-        "       f.started_at, f.completion_timestamp, " +
-        "       cj.custom_job_id, cj.cutting_length_meters, cj.number_of_cuts, " +
-        "       cj.bending_angle_degrees, cj.number_of_bends, cj.design_file_path, " +
-        "       o.order_reference, COALESCE(p.product_name, oi.item_description) AS product_name " +
-        "FROM tbl_fabrication_logs f " +
-        "JOIN tbl_custom_jobs cj ON cj.custom_job_id = f.custom_job_id " +
-        "JOIN tbl_order_items oi ON oi.order_item_id = cj.order_item_id " +
-        "JOIN tbl_orders o ON o.order_id = oi.order_id " +
-        "LEFT JOIN tbl_products p ON p.product_id = oi.product_id " +
-        "WHERE f.production_status IN ('queued','in_progress') " +
-        "ORDER BY FIELD(f.production_status,'in_progress','queued'), f.fab_log_id"
-    );
-    res.json({ jobs: rows });
+    const fid = parseInt(req.params.fid, 10);
+    const notes = String((req.body || {}).notes || "").slice(0, 4000);
+    await db.execute("UPDATE tbl_fabrication_logs SET fabrication_notes=? WHERE fab_log_id=?", [notes, fid]);
+    await db.audit(req.user.user_id, `Updated fabrication notes on job #${fid}`, "tbl_fabrication_logs", clientIp(req));
+    res.json({ ok: true });
   })
 );
 
@@ -969,7 +1155,21 @@ app.post(
   h(async (req, res) => {
     const fid = parseInt(req.params.fid, 10);
     const b = req.body || {};
-    const action = b.action; // 'start' | 'complete'
+    const action = b.action; // start | pause | resume | send_qa | qa_fail | complete
+
+    // The main fabricator owns the job's progress. A helper can see it and
+    // report damage on it, but cannot start, pause or finish it.
+    const own = await db.query(
+      "SELECT assigned_to, helper_1, helper_2 FROM tbl_fabrication_logs WHERE fab_log_id=?",
+      [fid], true);
+    if (!own) return res.status(404).json({ error: "Job not found" });
+    const isHelper = own.helper_1 === req.user.user_id || own.helper_2 === req.user.user_id;
+    if (isHelper && own.assigned_to !== req.user.user_id && req.user.role !== "Administrator") {
+      return res.status(403).json({
+        error: "You are a helper on this job. Only the main fabrication staff can change its status.",
+      });
+    }
+
     if (action === "start") {
       await db.execute(
         "UPDATE tbl_fabrication_logs SET production_status='in_progress', " +
@@ -985,8 +1185,26 @@ app.post(
           "WHERE fab_log_id=?",
         [scrap, req.user.user_id, fid]
       );
+      // A storefront order finishes differently: there is no tbl_orders row to
+      // move, so the online order is marked ready and the Sales Manager decides
+      // when to release it to the delivery panel.
+      const online = await db.query(
+        "SELECT online_order_id FROM tbl_fabrication_logs WHERE fab_log_id=?", [fid], true);
+      if (online && online.online_order_id) {
+        const left = await db.query(
+          "SELECT COUNT(*) c FROM tbl_fabrication_logs " +
+            "WHERE online_order_id=? AND production_status <> 'completed'",
+          [online.online_order_id], true);
+        if (left && left.c === 0) {
+          await db.execute(
+            "UPDATE tbl_online_orders SET status='ready_for_delivery', fabrication_done_at=NOW() " +
+              "WHERE online_order_id=?",
+            [online.online_order_id]);
+        }
+      }
+
       const order = await db.query(
-        "SELECT o.order_id FROM tbl_fabrication_logs f " +
+        "SELECT o.order_id, o.fulfillment FROM tbl_fabrication_logs f " +
           "JOIN tbl_custom_jobs cj ON cj.custom_job_id=f.custom_job_id " +
           "JOIN tbl_order_items oi ON oi.order_item_id=cj.order_item_id " +
           "JOIN tbl_orders o ON o.order_id=oi.order_id WHERE f.fab_log_id=?",
@@ -1004,7 +1222,10 @@ app.post(
         );
         if (remaining && remaining.c === 0) {
           await db.execute("UPDATE tbl_orders SET order_status='ready' WHERE order_id=?", [order.order_id]);
-          if (!(await db.query("SELECT 1 FROM tbl_deliveries WHERE order_id=?", [order.order_id], true))) {
+          // A pick-up sale waits at the shop instead. Sales from before the
+          // fulfilment column existed (NULL) keep going to delivery as they did.
+          if (order.fulfillment !== "pickup" &&
+              !(await db.query("SELECT 1 FROM tbl_deliveries WHERE order_id=?", [order.order_id], true))) {
             await db.execute("INSERT INTO tbl_deliveries (order_id, delivery_status) VALUES (?,'queued')", [
               order.order_id,
             ]);
@@ -1012,8 +1233,35 @@ app.post(
         }
       }
       await db.audit(req.user.user_id, `Completed fabrication #${fid}`, "tbl_fabrication_logs", clientIp(req));
+    } else if (action === "pause") {
+      await db.execute(
+        "UPDATE tbl_fabrication_logs SET production_status='paused', paused_at=NOW() " +
+          "WHERE fab_log_id=? AND production_status='in_progress'", [fid]);
+      await db.audit(req.user.user_id, `Paused fabrication job #${fid}`, "tbl_fabrication_logs", clientIp(req));
+    } else if (action === "resume") {
+      await db.execute(
+        "UPDATE tbl_fabrication_logs SET production_status='in_progress', paused_at=NULL, employee_id=? " +
+          "WHERE fab_log_id=? AND production_status IN ('paused','qa_failed')",
+        [req.user.user_id, fid]);
+      await db.audit(req.user.user_id, `Resumed fabrication job #${fid}`, "tbl_fabrication_logs", clientIp(req));
+    } else if (action === "send_qa") {
+      await db.execute(
+        "UPDATE tbl_fabrication_logs SET production_status='for_qa', sent_to_qa_at=NOW() " +
+          "WHERE fab_log_id=? AND production_status IN ('in_progress','paused')", [fid]);
+      await db.audit(req.user.user_id, `Sent job #${fid} to QA`, "tbl_fabrication_logs", clientIp(req));
+    } else if (action === "qa_fail") {
+      const reason = String(b.reason || "").trim();
+      if (!reason) return res.status(400).json({ error: "A reason is required when QA fails." });
+      await db.execute(
+        "UPDATE tbl_fabrication_logs SET production_status='qa_failed', qa_failed_reason=?, " +
+          "qa_by=?, qa_at=NOW() WHERE fab_log_id=?",
+        [reason.slice(0, 500), req.user.user_id, fid]);
+      await db.audit(req.user.user_id, `QA failed job #${fid}: ${reason.slice(0, 80)}`,
+                     "tbl_fabrication_logs", clientIp(req));
     } else {
-      return res.status(400).json({ error: "action must be 'start' or 'complete'" });
+      return res.status(400).json({
+        error: "action must be one of: start, pause, resume, send_qa, qa_fail, complete",
+      });
     }
     res.json({ ok: true });
   })
@@ -1079,12 +1327,11 @@ app.post(
     // Proof of delivery: a captured photo (multipart) + a signature data-URL.
     const did = parseInt(req.params.did, 10);
     const signature = req.body.signature; // data:image/png;base64,...
-    let imagePath = null;
+    let imagePath = null;   // stored in tbl_uploads, and on disk when possible
     if (req.file) {
       const safe = `pod_${did}_${Math.floor(Date.now() / 1000)}.jpg`;
       const dest = path.join(UPLOAD_DIR, safe);
-      fs.renameSync(req.file.path, dest);
-      imagePath = `uploads/${safe}`;
+      imagePath = await req.app.locals.saveUpload(req.file, safe, req.user.user_id);
     }
     await db.execute(
       "UPDATE tbl_deliveries SET proof_of_delivery_image=?, digital_signature_data=?, " +
@@ -1139,6 +1386,25 @@ app.get("/", (req, res) => {
   res.sendFile(path.join(FRONTEND_DIR, "index.html"));
 });
 
+app.use("/uploads", express.static(UPLOAD_DIR, { fallthrough: true }));
+/**
+ * Any upload the disk does not have is served from MySQL. After a redeploy on
+ * a host with a throwaway filesystem, this is every one of them.
+ */
+app.get(
+  "/uploads/:name",
+  h(async (req, res) => {
+    const name = String(req.params.name || "");
+    if (!/^[A-Za-z0-9._-]{1,160}$/.test(name)) return res.status(404).json({ error: "Not found" });
+    const row = await db.query(
+      "SELECT mime_type, content FROM tbl_uploads WHERE filename=?", [name], true);
+    if (!row) return res.status(404).json({ error: "Not found" });
+    res.setHeader("Content-Type", row.mime_type || "application/octet-stream");
+    // The name carries a timestamp, so a stored picture never changes.
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    res.send(row.content);
+  })
+);
 app.use(express.static(FRONTEND_DIR));
 
 app.get(/^\/(?!api\/).*/, (req, res) => {
@@ -1187,8 +1453,10 @@ app.use((err, req, res, next) => {
 app.listen(config.PORT, "0.0.0.0", () => {
   console.log("=".repeat(64));
   console.log("  Galaxy Trading backend");
-  console.log(`  Storefront : http://localhost:${config.PORT}/`);
-  console.log(`  Staff portal: http://localhost:${config.PORT}/staff/portal.html`);
+  const base = process.env.PUBLIC_URL || `http://localhost:${config.PORT}`;
+  console.log(`  Storefront : ${base}/`);
+  console.log(`  Staff portal: ${base}/staff/portal.html`);
+  console.log(`  Uploads   : ${UPLOAD_DIR}`);
   console.log(`  DB: ${config.DB_USER}@${config.DB_HOST}:${config.DB_PORT}/${config.DB_NAME}`);
   console.log("=".repeat(64));
 });
