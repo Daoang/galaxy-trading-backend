@@ -32,7 +32,7 @@ const suppliers = require("./suppliers");
 const payments = require("./payments");
 const mailer = require("./mailer");
 // Storefront catalog, read for its list of customizable products.
-const catalog = require("../products.js");
+const catalog = require("./products.js");
 
 const FRONTEND_DIR = path.resolve(__dirname, "..");
 // UPLOAD_DIR in .env moves this onto a mounted disk for hosts with an
