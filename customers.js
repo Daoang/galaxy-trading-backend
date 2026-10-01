@@ -22,6 +22,8 @@ const twofactor = require("./twofactor");
 // The storefront catalog. Read here only to know which products may be
 // customized (CUSTOMIZABLE_NAMES), so page and server share one list.
 const catalog = require("./products.js");
+const places = require("./locations.js");
+const stock = require("./stock");
 
 const CUSTOMER_ROLE_ID = 6; // tbl_roles: 6 = 'Customer'
 
@@ -29,7 +31,7 @@ const CUSTOMER_ROLE_ID = 6; // tbl_roles: 6 = 'Customer'
 // charged never depends on numbers posted by the browser.
 const CUT_FEE = 20;        // pesos per cut
 const BEND_FEE = 20;       // pesos per bend
-const DELIVERY_FEE = config.DELIVERY_FEE;  // flat door-to-door fee; pick-up is free
+const DELIVERY_FEE = config.ONLINE_DELIVERY_FEE;  // storefront door-to-door fee; pick-up is free
 const SPLIT_RATE = 0.5;    // split payment = 50% now
 
 const peso = (n) => Math.round((Number(n) || 0) * 100) / 100;
@@ -230,7 +232,7 @@ const emailTaken = (email) => db.query("SELECT 1 FROM tbl_users WHERE email=?", 
  * Per-address throttle shared by start and resend. Resolves to null when a
  * code may be sent, otherwise to { status, body } to reply with.
  */
-async function codeThrottle(email) {
+async function codeThrottle(email, purpose = "signup") {
   // Keep the table from growing forever: anything a day old is useless.
   await db.execute(
     "DELETE FROM tbl_email_verifications WHERE created_at < DATE_SUB(NOW(), INTERVAL 1 DAY)");
@@ -239,8 +241,8 @@ async function codeThrottle(email) {
     "SELECT COUNT(*) AS hour_count, " +
       "       COALESCE(TIMESTAMPDIFF(SECOND, MAX(created_at), NOW()), 999999) AS since_last " +
       "FROM tbl_email_verifications " +
-      "WHERE email=? AND purpose='signup' AND created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)",
-    [email], true);
+      "WHERE email=? AND purpose=? AND created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)",
+    [email, purpose], true);
   if (recent && recent.since_last < RESEND_GAP_SEC) {
     const wait = RESEND_GAP_SEC - recent.since_last;
     return { status: 429, body: { error: `Please wait ${wait} seconds before asking for another code.`,
@@ -257,7 +259,7 @@ async function codeThrottle(email) {
  * same attempt are retired, so only the newest one works.
  * Resolves to { ok:true, delivery } or { ok:false, status, error }.
  */
-async function issueCode(req, email, tokenHash, passwordHash) {
+async function issueCode(req, email, tokenHash, passwordHash, purpose = "signup") {
   const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
   const sent = await mailer.sendVerificationCode(req, email, code, CODE_TTL_MIN);
   if (!sent.ok) return sent;
@@ -269,20 +271,58 @@ async function issueCode(req, email, tokenHash, passwordHash) {
   await db.execute(
     "INSERT INTO tbl_email_verifications " +
       "(email, purpose, code_hash, password_hash, signup_token, expires_at, ip_address) " +
-      "VALUES (?, 'signup', ?, ?, ?, DATE_ADD(NOW(), INTERVAL ? MINUTE), ?)",
-    [email, hashCode(email, code), passwordHash, tokenHash, CODE_TTL_MIN,
+      "VALUES (?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL ? MINUTE), ?)",
+    [email, purpose, hashCode(email, code), passwordHash, tokenHash, CODE_TTL_MIN,
      String(clientIp(req) || "").slice(0, 45)]);
   return { ok: true, delivery: sent.delivery };
 }
 
-/** The live (unused) row for one sign-up attempt, or null. */
-function pendingSignup(email, tokenHash) {
+/** The live (unused) row for one attempt, or null. */
+function pendingSignup(email, tokenHash, purpose = "signup") {
   return db.query(
     "SELECT verification_id, code_hash, password_hash, attempts, expires_at < NOW() AS expired " +
       "FROM tbl_email_verifications " +
-      "WHERE email=? AND signup_token=? AND purpose='signup' AND consumed_at IS NULL " +
+      "WHERE email=? AND signup_token=? AND purpose=? AND consumed_at IS NULL " +
       "ORDER BY verification_id DESC LIMIT 1",
-    [email, tokenHash], true);
+    [email, tokenHash, purpose], true);
+}
+
+/**
+ * Compare a typed code with the stored one, counting the wrong guesses.
+ * Resolves to null when it matches, otherwise to { status, body } to reply
+ * with. The comparison itself is constant-time.
+ */
+async function checkCode(pending, email, code) {
+  if (pending.expired) {
+    return { status: 400, body: { error: "That code has expired. Tap Resend OTP for a new one." } };
+  }
+  if (pending.attempts >= CODE_MAX_ATTEMPTS) {
+    return { status: 400, body: { error: "Too many wrong codes. Tap Resend OTP for a new one.",
+                                  attempts_left: 0 } };
+  }
+  const a = Buffer.from(hashCode(email, code));
+  const e = Buffer.from(pending.code_hash);
+  if (a.length === e.length && crypto.timingSafeEqual(a, e)) return null;
+
+  await db.execute(
+    "UPDATE tbl_email_verifications SET attempts = attempts + 1 WHERE verification_id=?",
+    [pending.verification_id]);
+  const left = Math.max(0, CODE_MAX_ATTEMPTS - (pending.attempts + 1));
+  return { status: 400, body: {
+    error: left > 0
+      ? `That code is not right. ${left} attempt${left === 1 ? "" : "s"} left.`
+      : "Too many wrong codes. Tap Resend OTP for a new one.",
+    attempts_left: left,
+  } };
+}
+
+/** Spend a code so a replayed request cannot use it twice. */
+async function spendCode(verificationId) {
+  const spent = await db.pool.query(
+    "UPDATE tbl_email_verifications SET consumed_at=NOW() " +
+      "WHERE verification_id=? AND consumed_at IS NULL",
+    [verificationId]);
+  return !!spent[0].affectedRows;
 }
 
 router.post(
@@ -361,36 +401,12 @@ router.post(
     if (!pending || !pending.password_hash) {
       return res.status(400).json({ error: SIGNUP_EXPIRED, restart: true });
     }
-    if (pending.expired) {
-      return res.status(400).json({ error: "That code has expired. Tap Resend OTP for a new one." });
-    }
-    if (pending.attempts >= CODE_MAX_ATTEMPTS) {
-      return res.status(400).json({ error: "Too many wrong codes. Tap Resend OTP for a new one.",
-                                    attempts_left: 0 });
-    }
-
-    const a = Buffer.from(hashCode(email, code));
-    const e = Buffer.from(pending.code_hash);
-    if (a.length !== e.length || !crypto.timingSafeEqual(a, e)) {
-      await db.execute(
-        "UPDATE tbl_email_verifications SET attempts = attempts + 1 WHERE verification_id=?",
-        [pending.verification_id]);
-      const left = Math.max(0, CODE_MAX_ATTEMPTS - (pending.attempts + 1));
-      return res.status(400).json({
-        error: left > 0
-          ? `That code is not right. ${left} attempt${left === 1 ? "" : "s"} left.`
-          : "Too many wrong codes. Tap Resend OTP for a new one.",
-        attempts_left: left,
-      });
-    }
+    const bad = await checkCode(pending, email, code);
+    if (bad) return res.status(bad.status).json(bad.body);
 
     // Spend the code before creating anything, so a replayed request cannot
     // create a second account from one email.
-    const spent = await db.pool.query(
-      "UPDATE tbl_email_verifications SET consumed_at=NOW() " +
-        "WHERE verification_id=? AND consumed_at IS NULL",
-      [pending.verification_id]);
-    if (!spent[0].affectedRows) {
+    if (!(await spendCode(pending.verification_id))) {
       return res.status(409).json({ error: "That code has already been used." });
     }
 
@@ -558,11 +574,138 @@ router.post(
     if (!row || !auth.verifyPassword(current, row.password_hash)) {
       return res.status(400).json({ error: "Current password is incorrect" });
     }
+    // A customer's own password is changed through the two steps below, so a
+    // session alone cannot do it. Staff accounts, which may have no mailbox on
+    // file, keep the direct route.
+    if (req.user.role === "Customer") {
+      return res.status(400).json({
+        error: "Use the emailed code to confirm a password change.",
+        needs_code: true,
+      });
+    }
     await db.execute("UPDATE tbl_users SET password_hash=? WHERE user_id=?", [
       auth.hashPassword(next),
       req.user.user_id,
     ]);
     await db.audit(req.user.user_id, "Changed own password", "tbl_users", clientIp(req));
+    res.json({ ok: true });
+  })
+);
+
+// ---------------------------------------------------------------------------
+//  Changing the password, with the mailbox as proof.
+//
+//    1. POST /api/account/password/start  { current_password, new_password }
+//         -> both passwords are checked, a 6-digit code is emailed, and the
+//            browser gets a change_token (never the code itself)
+//    2. POST /api/account/password/verify { change_token, code }
+//         -> the new password, kept as a PBKDF2 hash since step 1, is applied
+//       POST /api/account/password/resend { change_token }
+//
+//  Nothing changes until the code is typed, so a borrowed session - or a
+//  current password read over someone's shoulder - is not enough on its own.
+// ---------------------------------------------------------------------------
+
+const PW_CHANGE_EXPIRED = "That password change has expired. Start again.";
+
+/** The signed-in account's own address, or null when it has none on file. */
+async function accountEmail(userId) {
+  const row = await db.query("SELECT email FROM tbl_users WHERE user_id=?", [userId], true);
+  return normaliseEmail(row && row.email);
+}
+
+router.post(
+  "/api/account/password/start",
+  auth.loginRequired,
+  h(async (req, res) => {
+    const b = req.body || {};
+    const current = String(b.current_password || "");
+    const next = String(b.new_password || "");
+
+    const row = await db.query("SELECT password_hash, email FROM tbl_users WHERE user_id=?",
+                               [req.user.user_id], true);
+    const email = normaliseEmail(row && row.email);
+    if (!email) {
+      return res.status(400).json({
+        error: "This account has no email address on file, so a code cannot be sent." });
+    }
+    const pwErr = req.user.role === "Customer"
+      ? security.checkCustomerPassword(next, email)
+      : security.checkPasswordStrength(next, req.user.username);
+    if (pwErr) return res.status(400).json({ error: pwErr, field: "new" });
+    if (!row || !auth.verifyPassword(current, row.password_hash)) {
+      return res.status(400).json({ error: "Current password is incorrect", field: "current" });
+    }
+    if (auth.verifyPassword(next, row.password_hash)) {
+      return res.status(400).json({ error: "That is already your password.", field: "new" });
+    }
+
+    const limited = await codeThrottle(email, "password");
+    if (limited) return res.status(limited.status).json(limited.body);
+
+    // Names this attempt: only the browser holding the token can finish it.
+    const token = crypto.randomBytes(32).toString("hex");
+    const sent = await issueCode(req, email, hashToken(token), auth.hashPassword(next), "password");
+    if (!sent.ok) return res.status(sent.status || 502).json({ error: sent.error });
+
+    res.json({ ok: true, email, change_token: token, expires_in: CODE_TTL_MIN * 60,
+               resend_after: RESEND_GAP_SEC, delivery: sent.delivery });
+  })
+);
+
+router.post(
+  "/api/account/password/resend",
+  auth.loginRequired,
+  h(async (req, res) => {
+    const token = cleanToken((req.body || {}).change_token);
+    const email = await accountEmail(req.user.user_id);
+    if (!token || !email) return res.status(400).json({ error: PW_CHANGE_EXPIRED, restart: true });
+
+    const tokenHash = hashToken(token);
+    const pending = await pendingSignup(email, tokenHash, "password");
+    if (!pending || !pending.password_hash) {
+      return res.status(400).json({ error: PW_CHANGE_EXPIRED, restart: true });
+    }
+    const limited = await codeThrottle(email, "password");
+    if (limited) return res.status(limited.status).json(limited.body);
+
+    const sent = await issueCode(req, email, tokenHash, pending.password_hash, "password");
+    if (!sent.ok) return res.status(sent.status || 502).json({ error: sent.error });
+    res.json({ ok: true, email, expires_in: CODE_TTL_MIN * 60,
+               resend_after: RESEND_GAP_SEC, delivery: sent.delivery });
+  })
+);
+
+router.post(
+  "/api/account/password/verify",
+  auth.loginRequired,
+  h(async (req, res) => {
+    const b = req.body || {};
+    const token = cleanToken(b.change_token);
+    const code = String(b.code || "").replace(/\D/g, "");
+    const email = await accountEmail(req.user.user_id);
+    if (!token || !email) return res.status(400).json({ error: PW_CHANGE_EXPIRED, restart: true });
+    if (code.length !== 6) return res.status(400).json({ error: "Enter the 6-digit code we emailed you." });
+
+    const pending = await pendingSignup(email, hashToken(token), "password");
+    if (!pending || !pending.password_hash) {
+      return res.status(400).json({ error: PW_CHANGE_EXPIRED, restart: true });
+    }
+    const bad = await checkCode(pending, email, code);
+    if (bad) return res.status(bad.status).json(bad.body);
+    if (!(await spendCode(pending.verification_id))) {
+      return res.status(409).json({ error: "That code has already been used." });
+    }
+
+    await db.execute("UPDATE tbl_users SET password_hash=? WHERE user_id=?",
+                     [pending.password_hash, req.user.user_id]);
+    // The hash now lives in tbl_users; no pending copy should stay behind.
+    await db.execute(
+      "UPDATE tbl_email_verifications SET password_hash=NULL " +
+        "WHERE email=? AND purpose='password' AND password_hash IS NOT NULL",
+      [email]);
+    await db.audit(req.user.user_id, "Changed own password (email code verified)",
+                   "tbl_users", clientIp(req));
     res.json({ ok: true });
   })
 );
@@ -576,6 +719,34 @@ router.delete(
     if (req.user.role !== "Customer") {
       return res.status(403).json({ error: "Only customer accounts can be deleted from here." });
     }
+
+    // An order is the shop's record as much as the customer's: tbl_online_orders
+    // is ON DELETE CASCADE, so removing the account would take the sales history
+    // with it. An order still being worked on must not lose its customer either.
+    const open = await db.query(
+      "SELECT COUNT(*) AS n FROM tbl_online_orders " +
+        "WHERE user_id=? AND status IN ('pending','accepted')",
+      [req.user.user_id], true);
+    if (open && open.n) {
+      return res.status(409).json({
+        error: `You have ${open.n} order${open.n === 1 ? "" : "s"} still being processed. ` +
+               "The account can't be deleted until they are completed or declined.",
+        open_orders: open.n,
+      });
+    }
+    const past = await db.query(
+      "SELECT (SELECT COUNT(*) FROM tbl_online_orders WHERE user_id=?) AS online, " +
+        "(SELECT COUNT(*) FROM tbl_orders WHERE customer_id=?) AS walkin",
+      [req.user.user_id, req.user.user_id], true);
+    const total = (past ? Number(past.online) + Number(past.walkin) : 0);
+    if (total) {
+      return res.status(409).json({
+        error: `This account has ${total} order${total === 1 ? "" : "s"} on record, which the shop ` +
+               "has to keep. Ask Galaxy Trading to close the account for you.",
+        past_orders: total,
+      });
+    }
+
     // Audit first: tbl_audit_logs keeps the user_id, so the trail is written
     // while the row still exists.
     await db.audit(req.user.user_id, "Deleted own account", "tbl_users", clientIp(req));
@@ -591,16 +762,91 @@ router.delete(
 //  so the write endpoint replaces the customer's list in one transaction. That
 //  keeps the existing UI code working without an id round-trip per row.
 // ===========================================================================
+/** The name as one line, from the parts when they are there. */
+function joinName(a) {
+  const bits = [a.first_name, a.middle_initial ? String(a.middle_initial).trim() : "", a.surname]
+    .map((x) => String(x == null ? "" : x).trim())
+    .filter(Boolean);
+  return bits.join(" ");
+}
+
 function addressOut(row) {
   return {
-    name: row.recipient_name || "",
+    // Rows saved before the form was split keep their single name and city;
+    // the parts are empty strings until the customer edits that address.
+    name: joinName(row) || row.recipient_name || "",
+    first_name: row.first_name || "",
+    middle_initial: row.middle_initial || "",
+    surname: row.surname || "",
     phone: row.phone || "",
     street: row.street || "",
+    region: row.region || "",
+    province: row.province || "",
     city: row.city || "",
+    barangay: row.barangay || "",
     postal: row.postal || "",
     label: row.label || "Home",
     default: !!row.is_default,
   };
+}
+
+/**
+ * Check and tidy one address from the browser.
+ *
+ * The form on the page checks the same things, so this is for a request that
+ * did not come from it. A row that was saved before the form was split has no
+ * parts and no barangay: those stay as they are rather than being rejected, so
+ * an address book saved years ago still saves.
+ *
+ * Resolves to { ok:true, value } or { ok:false, error }.
+ */
+function readAddress(a, i) {
+  const str = (v, n) => String(v == null ? "" : v).trim().slice(0, n);
+  const where = `Address ${i + 1}: `;
+
+  const first = str(a.first_name, 60);
+  const middle = str(a.middle_initial, 10);
+  const surname = str(a.surname, 60);
+  const legacyName = str(a.name, 120);
+  const split = !!(first || middle || surname);
+  if (split && !first) return { ok: false, error: where + "first name is required." };
+  if (split && !surname) return { ok: false, error: where + "surname is required." };
+  if (!split && !legacyName) return { ok: false, error: where + "a name is required." };
+
+  // Digits only, eleven of them, starting 09 — and kept as text, so the
+  // leading zero survives. A row saved before this rule existed keeps what it
+  // has, so a customer is never locked out of their own address book.
+  const typed = str(a.phone, 40);
+  const digits = typed.replace(/[^0-9]/g, "");
+  const phone = /^09\d{9}$/.test(digits) ? digits : (split ? "" : typed);
+  if (split && !phone) {
+    return { ok: false, error: where + "the phone number must be 11 digits starting with 09." };
+  }
+
+  const street = str(a.street, 255);
+  if (!street) return { ok: false, error: where + "street name, building and house no. is required." };
+
+  // Places are only accepted when they are on the shop's own list.
+  const region = str(a.region, 60), province = str(a.province, 60);
+  const city = str(a.city, 120), barangay = str(a.barangay, 80);
+  if (region && !places.inList(places.REGIONS, region)) return { ok: false, error: where + "that region is not one we deliver to." };
+  if (province && !places.inList(places.PROVINCES, province)) return { ok: false, error: where + "that province is not one we deliver to." };
+  if (city && barangay && !places.inList(places.CITIES, city)) return { ok: false, error: where + "that city is not one we deliver to." };
+  if (barangay && !places.inList(places.BARANGAYS, barangay)) return { ok: false, error: where + "that barangay is not on our list." };
+  if (barangay && !city) return { ok: false, error: where + "a city is required." };
+
+  const postal = str(a.postal, 20);
+  if (postal && !/^[0-9]{3,6}$/.test(postal)) return { ok: false, error: where + "the postal code is digits only." };
+
+  const name = joinName({ first_name: first, middle_initial: middle, surname }) || legacyName;
+  return { ok: true, value: {
+    label: str(a.label, 20) || "Home",
+    name, first_name: first || null, middle_initial: middle || null, surname: surname || null,
+    phone: phone || null, street,
+    region: region || null, province: province || null, city: city || null, barangay: barangay || null,
+    postal: postal || null,
+    isDefault: !!a.default,
+  } };
 }
 
 router.get(
@@ -620,26 +866,37 @@ router.put(
   auth.loginRequired,
   h(async (req, res) => {
     const list = Array.isArray(req.body && req.body.addresses) ? req.body.addresses : [];
+    if (list.length > 20) return res.status(400).json({ error: "That is more addresses than an account may keep." });
+
+    const clean = [];
+    for (let i = 0; i < list.length; i++) {
+      const r = readAddress(list[i] || {}, i);
+      if (!r.ok) return res.status(400).json({ error: r.error, index: i });
+      clean.push(r.value);
+    }
+    // Exactly one default: the one the customer ticked, otherwise the first.
+    // Setting a new one takes the flag off the old one by construction.
+    let chosen = clean.findIndex((a) => a.isDefault);
+    if (chosen < 0 && clean.length) chosen = 0;
+    clean.forEach((a, i) => { a.isDefault = i === chosen; });
+
     const conn = await db.pool.getConnection();
     try {
       await conn.beginTransaction();
       await conn.query("DELETE FROM tbl_customer_addresses WHERE user_id=?", [req.user.user_id]);
-      for (let i = 0; i < list.length; i++) {
-        const a = list[i] || {};
+      for (let i = 0; i < clean.length; i++) {
+        const a = clean[i];
         await conn.query(
           "INSERT INTO tbl_customer_addresses " +
-            "(user_id, label, recipient_name, phone, street, city, postal, is_default, sort_order) " +
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "(user_id, label, recipient_name, first_name, middle_initial, surname, phone, street, " +
+            " region, province, city, barangay, postal, is_default, sort_order) " +
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
           [
-            req.user.user_id,
-            a.label || "Home",
-            a.name || null,
-            a.phone || null,
-            a.street || null,
-            a.city || null,
-            a.postal || null,
-            a.default ? 1 : 0,
-            i,
+            req.user.user_id, a.label, a.name || null,
+            a.first_name, a.middle_initial, a.surname,
+            a.phone, a.street,
+            a.region, a.province, a.city, a.barangay, a.postal,
+            a.isDefault ? 1 : 0, i,
           ]
         );
       }
@@ -651,6 +908,79 @@ router.put(
       conn.release();
     }
     res.json({ ok: true, count: list.length });
+  })
+);
+
+// ===========================================================================
+//  NOTIFICATIONS
+//
+//  One row per event a customer should know about. The unique key on
+//  (online_order_id, kind) is what stops a second copy: declining an order
+//  twice, or a reloaded page, updates the row that is already there instead of
+//  adding another.
+// ===========================================================================
+
+/** Tell one customer about one thing. Never throws into the caller's path. */
+async function notify(userId, orderId, kind, { title, message, reason }) {
+  if (!userId) return null;
+  try {
+    await db.execute(
+      "INSERT INTO tbl_notifications (user_id, online_order_id, kind, title, message, reason) " +
+        "VALUES (?,?,?,?,?,?) " +
+        "ON DUPLICATE KEY UPDATE title=VALUES(title), message=VALUES(message), " +
+        "  reason=VALUES(reason), created_at=NOW(), read_at=NULL",
+      [userId, orderId || null, kind, String(title).slice(0, 120),
+       String(message).slice(0, 600), reason ? String(reason).slice(0, 500) : null]);
+    return true;
+  } catch (e) {
+    // A notification is never worth failing the action it describes.
+    console.error("[NOTIFY] could not record '" + kind + "' for user " + userId + ":", e.message);
+    return false;
+  }
+}
+
+function notificationOut(row) {
+  return {
+    id: row.notification_id,
+    order_id: row.online_order_id,
+    order_ref: row.order_ref || "",
+    kind: row.kind,
+    title: row.title,
+    message: row.message,
+    reason: row.reason || "",
+    time: new Date(row.created_at).toISOString(),
+    read: !!row.read_at,
+  };
+}
+
+/** The signed-in customer's own notifications, newest first. */
+router.get(
+  "/api/account/notifications",
+  auth.loginRequired,
+  h(async (req, res) => {
+    const rows = await db.query(
+      "SELECT n.*, o.order_ref FROM tbl_notifications n " +
+        "LEFT JOIN tbl_online_orders o ON o.online_order_id = n.online_order_id " +
+        "WHERE n.user_id=? ORDER BY n.created_at DESC, n.notification_id DESC LIMIT 100",
+      [req.user.user_id]);
+    res.json({
+      notifications: rows.map(notificationOut),
+      unread: rows.filter((r) => !r.read_at).length,
+    });
+  })
+);
+
+/** Opening one marks it read. Only the owner can, and only their own. */
+router.patch(
+  "/api/account/notifications/:id/read",
+  auth.loginRequired,
+  h(async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: "Which notification?" });
+    const done = await db.pool.query(
+      "UPDATE tbl_notifications SET read_at=NOW() WHERE notification_id=? AND user_id=? AND read_at IS NULL",
+      [id, req.user.user_id]);
+    res.json({ ok: true, changed: done[0].affectedRows });
   })
 );
 
@@ -696,6 +1026,9 @@ function orderOut(row, items, fab) {
     voucher_discount: parseFloat(row.voucher_discount || 0),
     cut_fee: parseFloat(row.cut_fee || 0),
     bend_fee: parseFloat(row.bend_fee || 0),
+    decline_reason: row.decline_reason || "",
+    declined_at: row.declined_at ? new Date(row.declined_at).toISOString() : null,
+    declined_by_name: row.declined_by_name || "",
     payment_channel: row.payment_channel || "cash",
     payment_status: row.payment_status || "unpaid",
     gcash_reference: row.gcash_reference || "",
@@ -720,8 +1053,9 @@ function orderOut(row, items, fab) {
 /** Load orders plus their line items in two queries (no N+1 per order). */
 async function loadOrders(where, params) {
   const orders = await db.query(
-    "SELECT o.*, u.username FROM tbl_online_orders o " +
+    "SELECT o.*, u.username, d.full_name AS declined_by_name FROM tbl_online_orders o " +
       "JOIN tbl_users u ON u.user_id = o.user_id " +
+      "LEFT JOIN tbl_users d ON d.user_id = o.declined_by " +
       where +
       " ORDER BY o.ordered_at DESC, o.online_order_id DESC",
     params
@@ -844,6 +1178,21 @@ router.post(
       const cuts = isCustom ? Math.max(0, parseInt(it.cuts, 10) || 0) : 0;
       const bends = isCustom ? Math.max(0, parseInt(it.bends, 10) || 0) : 0;
 
+      // The quantity boxes on the storefront are capped by the live stock, but
+      // the page can be bypassed, so the shelf is checked here as well.
+      const onShelf = await db.query(
+        "SELECT product_name, stock_quantity FROM tbl_products WHERE sku=? AND status='active'",
+        [String(it.id || "")], true);
+      if (onShelf && qty > Number(onShelf.stock_quantity)) {
+        return res.status(400).json({
+          error: Number(onShelf.stock_quantity) > 0
+            ? `Only ${onShelf.stock_quantity} of "${onShelf.product_name}" left in stock.`
+            : `"${onShelf.product_name}" is out of stock.`,
+          item: String(it.id || ""),
+          available: Number(onShelf.stock_quantity),
+        });
+      }
+
       // Only the products in CUSTOMIZABLE_NAMES can be cut or bent. The page
       // hides the option for the rest; this stops a crafted request too.
       if (isCustom && !catalog.isCustomizable(String(it.id || ""))) {
@@ -902,7 +1251,13 @@ router.post(
     const balance = peso(total - paidNow);
 
     // ---- payment channel --------------------------------------------------
+    // Cash is a walk-in thing: an online order is paid through GCash, which is
+    // what the checkout page offers. Checked here too, since the page can be
+    // bypassed.
     const channel = b.payment_channel === "gcash" ? "gcash" : "cash";
+    if (channel !== "gcash") {
+      return res.status(400).json({ error: "Online orders are paid with GCash." });
+    }
     let gcashRef = null, gcashReceipt = null, paymentStatus = "unpaid";
     if (channel === "gcash") {
       // Same rule the counter uses, so one reference cannot pass one route and
@@ -923,6 +1278,25 @@ router.post(
     let orderId;
     try {
       await conn.beginTransaction();
+      // The shelf is checked once more here, inside the transaction, but it is
+      // not drawn yet: an online order takes its stock when the Sales Manager
+      // accepts it, so nothing is held while the shop has not agreed to it.
+      for (const it of priced) {
+        if (!it.product_ref) continue;
+        const [rows] = await conn.query(
+          "SELECT product_name, stock_quantity FROM tbl_products WHERE sku=? AND status='active'",
+          [it.product_ref]);
+        const row = rows && rows[0];
+        if (row && it.qty > Number(row.stock_quantity)) {
+          const left = Number(row.stock_quantity) || 0;
+          throw Object.assign(new Error("OUT_OF_STOCK"), {
+            outOfStock: left > 0
+              ? `Only ${left} of "${row.product_name}" left in stock.`
+              : `"${row.product_name}" is out of stock.`,
+          });
+        }
+      }
+
       const [result] = await conn.query(
         "INSERT INTO tbl_online_orders " +
           "(order_ref, user_id, customer_name, address, status, total, fulfillment, " +
@@ -967,6 +1341,8 @@ router.post(
       if (e.message === "VOUCHER_EXHAUSTED") {
         return res.status(400).json({ error: "That voucher was just fully redeemed. Please remove it." });
       }
+      // Someone else took the last of it between the check and the sale.
+      if (e.outOfStock) return res.status(400).json({ error: e.outOfStock });
       throw e;
     } finally {
       conn.release();
@@ -1113,14 +1489,114 @@ router.patch(
   auth.requireRole("Sales Manager", "Administrator"),
   h(async (req, res) => {
     const allowed = ["pending", "accepted", "declined"];
-    const status = String((req.body || {}).status || "");
+    const b = req.body || {};
+    const status = String(b.status || "");
     if (!allowed.includes(status)) {
       return res.status(400).json({ error: "status must be one of: " + allowed.join(", ") });
     }
+    // The customer is owed an explanation, so the Sales Manager types one.
+    const reason = String(b.reason || b.decline_reason || "").trim().slice(0, 500);
+    if (status === "declined" && !reason) {
+      return res.status(400).json({ error: "Say why the order is being declined.", field: "reason" });
+    }
+
+    const before = await db.query(
+      "SELECT online_order_id, user_id, order_ref, status, stock_taken FROM tbl_online_orders WHERE order_ref=?",
+      [req.params.ref], true);
+    if (!before) return res.status(404).json({ error: "No such order." });
+
+    // ---- the shelf ---------------------------------------------------------
+    // Accepting an order is what draws it, and `stock_taken` is what stops it
+    // ever being drawn twice: accepting an order that already holds its stock
+    // changes nothing, and giving it back clears the flag again.
+    const who = req.user.username;
+    const lines = await db.query(
+      "SELECT product_ref, item_name, quantity FROM tbl_online_order_items WHERE online_order_id=?",
+      [before.online_order_id]);
+
+    if (status === "accepted" && !before.stock_taken) {
+      const conn = await db.pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        for (const l of lines) {
+          if (!l.product_ref) continue;
+          const drawn = await stock.draw(conn.query.bind(conn), {
+            sku: l.product_ref, qty: l.quantity, source: "online",
+            reference: before.order_ref, by: who,
+            note: `Online order accepted (${l.item_name || l.product_ref})`,
+          });
+          if (!drawn.ok && !drawn.missing) {
+            await conn.rollback();
+            return res.status(409).json({
+              error: drawn.left > 0
+                ? `Only ${drawn.left} of "${drawn.name}" left in stock — this order needs ${l.quantity}.`
+                : `"${drawn.name}" is out of stock, so this order cannot be accepted.`,
+              item: l.product_ref,
+              available: drawn.left,
+            });
+          }
+        }
+        await conn.query("UPDATE tbl_online_orders SET stock_taken=1 WHERE online_order_id=?",
+                         [before.online_order_id]);
+        await conn.commit();
+      } catch (e) {
+        await conn.rollback();
+        throw e;
+      } finally {
+        conn.release();
+      }
+    } else if (status !== "accepted" && before.stock_taken) {
+      // Declined, or put back to pending, after it had been accepted: the shop
+      // is not making it after all, so the stock goes back on the shelf once.
+      const conn = await db.pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        for (const l of lines) {
+          if (!l.product_ref) continue;
+          await stock.giveBack(conn.query.bind(conn), {
+            sku: l.product_ref, qty: l.quantity, source: "return",
+            reference: before.order_ref, by: who,
+            note: status === "declined" ? "Online order declined" : "Acceptance withdrawn",
+          });
+        }
+        await conn.query("UPDATE tbl_online_orders SET stock_taken=0 WHERE online_order_id=?",
+                         [before.online_order_id]);
+        await conn.commit();
+      } catch (e) {
+        await conn.rollback();
+        throw e;
+      } finally {
+        conn.release();
+      }
+    }
+
     await db.execute(
       "UPDATE tbl_online_orders SET status=?, processed_at=? WHERE order_ref=?",
       [status, status === "pending" ? null : new Date(), req.params.ref]
     );
+
+    if (before && status === "declined") {
+      // Why, who and when - kept on the order itself, which stays where it is
+      // so the customer still sees it in their history.
+      await db.execute(
+        "UPDATE tbl_online_orders SET decline_reason=?, declined_by=?, declined_at=NOW() WHERE online_order_id=?",
+        [reason, req.user.user_id, before.online_order_id]);
+      await db.audit(req.user.user_id, `Declined online order ${before.order_ref}: ${reason}`,
+                     "tbl_online_orders", clientIp(req));
+      await notify(before.user_id, before.online_order_id, "order_declined", {
+        title: "Order Declined",
+        message: `Your order ${before.order_ref} has been declined.`,
+        reason,
+      });
+    } else if (before && status !== "declined" && before.status === "declined") {
+      // Taken back off the declined pile: the old reason no longer applies.
+      await db.execute(
+        "UPDATE tbl_online_orders SET decline_reason=NULL, declined_by=NULL, declined_at=NULL " +
+          "WHERE online_order_id=?", [before.online_order_id]);
+      await db.execute(
+        "DELETE FROM tbl_notifications WHERE online_order_id=? AND kind='order_declined'",
+        [before.online_order_id]);
+    }
     await db.audit(
       req.user.user_id,
       "Set online order " + req.params.ref + " to '" + status + "'",
