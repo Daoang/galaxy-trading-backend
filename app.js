@@ -208,7 +208,7 @@ app.get("/healthz", async (req, res) => {
     await db.query("SELECT 1");
     res.json({ ok: true, database: "up" });
   } catch (e) {
-    res.status(503).json({ ok: false, database: "down" });
+    res.status(503).json({ ok: false, database: "down", code: e.code, message: e.message });
   }
 });
 
