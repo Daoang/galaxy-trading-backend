@@ -67,10 +67,14 @@ const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET || "";
 const CAPTCHA_REQUIRED = bool("CAPTCHA_REQUIRED", false);
 
 // ----- Walk-in POS / VAT receipt --------------------------------------------
-// Flat door-to-door delivery fee. The storefront checkout charges it and the
-// POS adds it as a fixed "Delivery Fee" line; neither lets it be typed in.
-// (checkout.html shows the same ₱150 to customers.)
+// Flat door-to-door delivery fee for a walk-in sale: the POS adds it as a
+// fixed "Delivery Fee" line that cannot be typed in.
 const DELIVERY_FEE = 150;
+
+// What the storefront charges a customer for delivery. Kept apart from the
+// walk-in figure above because the shop prices the two differently.
+// (checkout.html shows the same ₱500 to customers.)
+const ONLINE_DELIVERY_FEE = 500;
 const VAT_RATE = parseFloat(process.env.VAT_RATE || "0.12"); // 12% VAT (Philippines), VAT-inclusive
 
 // Business header printed on the official receipt. Edit to match your BIR permit.
@@ -130,7 +134,7 @@ module.exports = {
   SECRET_KEY, TOKEN_TTL_HOURS, PORT,
   BRAND_LOGO, BRAND_LOGO_FALLBACK, brandLogo,
   HCAPTCHA_SECRET, TURNSTILE_SECRET, CAPTCHA_REQUIRED,
-  VAT_RATE, DELIVERY_FEE,
+  VAT_RATE, DELIVERY_FEE, ONLINE_DELIVERY_FEE,
   BUSINESS,
   EMAIL_PROVIDER, GMAIL_USER, GMAIL_APP_PASSWORD,
   EMAIL_API_KEY, EMAIL_FROM, EMAIL_FROM_NAME, EMAIL_API_URL,
