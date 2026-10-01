@@ -33,6 +33,7 @@ const payments = require("./payments");
 const mailer = require("./mailer");
 // Storefront catalog, read for its list of customizable products.
 const catalog = require("./products.js");
+const stock = require("./stock");
 
 const FRONTEND_DIR = path.resolve(__dirname, "..");
 // UPLOAD_DIR in .env moves this onto a mounted disk for hosts with an
@@ -210,6 +211,53 @@ app.get("/healthz", async (req, res) => {
     res.status(503).json({ ok: false, database: "down" });
   }
 });
+
+/**
+ * How much of each catalog item is on the shelf.
+ *
+ * Public, because the storefront shows it next to every quantity box. It says
+ * nothing beyond the count: no cost, no supplier, no reorder level. The sku
+ * column holds the catalog's own variant id, so the two line up exactly.
+ */
+app.get(
+  "/api/catalog/stock",
+  h(async (req, res) => {
+    const rows = await db.query(
+      "SELECT sku, stock_quantity FROM tbl_products WHERE status='active' AND sku IS NOT NULL AND sku <> ''"
+    );
+    const stock = {};
+    for (const r of rows) stock[r.sku] = Math.max(0, Number(r.stock_quantity) || 0);
+    // Never cached: the storefront must show what the Inventory holds now.
+    res.set("Cache-Control", "no-store");
+    res.json({ stock, count: rows.length, version: await stockVersion() });
+  })
+);
+
+/**
+ * A short string that changes whenever any product's stock does.
+ *
+ * The storefront asks for this every few seconds and re-reads the numbers only
+ * when it moves, so an Inventory Manager's edit - or another customer's
+ * checkout - reaches the shop pages within seconds without sending the whole
+ * list over and over.
+ */
+async function stockVersion() {
+  const row = await db.query(
+    "SELECT COUNT(*) AS n, COALESCE(SUM(stock_quantity),0) AS q, " +
+      "COALESCE(SUM(product_id * (stock_quantity + 1)),0) AS w, " +
+      "COALESCE(SUM(status='active'),0) AS a " +
+      "FROM tbl_products WHERE sku IS NOT NULL AND sku <> ''",
+    [], true);
+  return row ? `${row.n}-${row.q}-${row.w}-${row.a}` : "0";
+}
+
+app.get(
+  "/api/catalog/stock/version",
+  h(async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.json({ version: await stockVersion() });
+  })
+);
 
 app.get("/api/auth/me", auth.loginRequired, (req, res) => {
   res.json({ user: req.user });
@@ -772,6 +820,65 @@ app.get(
   })
 );
 
+/**
+ * Item History — every time the shelf moved, newest first.
+ *
+ * One row per product per sale: what it was, what was taken, what is left, the
+ * order it belonged to, whether it came from the storefront or the counter,
+ * and who was at the keyboard. Read by the Inventory Manager panel.
+ *
+ * ?source=online|walkin|return   ?q=<item name or reference>   ?limit=<n>
+ */
+app.get(
+  "/api/inventory/history",
+  auth.requireRole("Inventory Manager", "Administrator", "Sales Manager"),
+  h(async (req, res) => {
+    const where = ["m.item_type='product'"];
+    const params = [];
+    const source = String(req.query.source || "").trim();
+    if (["online", "walkin", "return"].includes(source)) {
+      where.push("m.source=?");
+      params.push(source);
+    }
+    const q = String(req.query.q || "").trim();
+    if (q) {
+      where.push("(m.item_name LIKE ? OR m.reference LIKE ?)");
+      params.push("%" + q + "%", "%" + q + "%");
+    }
+    const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 200));
+
+    const rows = await db.query(
+      "SELECT m.movement_id, m.item_id, m.item_name, m.movement, m.source, m.quantity, " +
+        "       m.stock_before, m.stock_after, m.reference, m.note, m.created_at, " +
+        "       COALESCE(u.full_name, m.performed_by) AS performed_by " +
+        "FROM tbl_stock_movements m " +
+        "LEFT JOIN tbl_users u ON u.username = m.performed_by " +
+        "WHERE " + where.join(" AND ") +
+        " ORDER BY m.created_at DESC, m.movement_id DESC LIMIT " + limit,
+      params
+    );
+
+    res.set("Cache-Control", "no-store");
+    res.json({
+      history: rows.map((r) => ({
+        id: r.movement_id,
+        product_id: r.item_id,
+        item: r.item_name,
+        movement: r.movement,                       // 'out' when sold, 'in' when returned
+        source: r.source || "",                     // 'online' | 'walkin' | 'return'
+        quantity: Number(r.quantity) || 0,
+        stock_before: r.stock_before == null ? null : Number(r.stock_before),
+        stock_after: Number(r.stock_after) || 0,
+        reference: r.reference || "",
+        note: r.note || "",
+        by: r.performed_by || "",
+        at: new Date(r.created_at).toISOString(),
+      })),
+      count: rows.length,
+    });
+  })
+);
+
 app.get(
   "/api/sales/config",
   auth.requireRole("Sales Manager", "Administrator"),
@@ -968,10 +1075,26 @@ app.post(
         [orderId, pid || null, desc, it._qty, it._price, it._sub]
       );
       if (pid) {
-        await db.execute(
-          "UPDATE tbl_products SET stock_quantity = GREATEST(stock_quantity-?,0) WHERE product_id=?",
-          [Math.trunc(it._qty), pid]
-        );
+        // Draw the shelf and write the Item History line in one place, so a
+        // walk-in sale and an accepted online order leave the same trail.
+        const drawn = await stock.draw(db.pool.query.bind(db.pool), {
+          productId: pid, qty: it._qty, source: "walkin",
+          reference: invoiceNo, by: req.user.username,
+          note: `Walk-in sale (${desc || "item"})`,
+        });
+        if (!drawn.ok && !drawn.missing) {
+          // The shelf moved between the cart and the receipt. The sale stands -
+          // the goods are over the counter - so the shortfall is recorded
+          // rather than hidden, and the floor is left at zero.
+          await db.execute(
+            "UPDATE tbl_products SET stock_quantity = 0 WHERE product_id=?", [pid]);
+          await stock.record(db.pool.query.bind(db.pool), {
+            productId: pid, name: desc || "Item", movement: "out", source: "walkin",
+            qty: it._qty, before: drawn.left, after: 0, reference: invoiceNo,
+            note: "Walk-in sale — only " + drawn.left + " were on the shelf",
+            by: req.user.username,
+          });
+        }
       }
       if (kind === "custom") {
         const cj = await db.execute(
