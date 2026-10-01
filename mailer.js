@@ -18,6 +18,8 @@
  *   still be tested. On any other host that is refused instead: a deployed
  *   site must not create accounts whose owners were never actually sent a code.
  */
+
+
 const nodemailer = require("nodemailer");
 const config = require("./config");
 
